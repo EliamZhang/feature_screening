@@ -1,0 +1,12 @@
+# 数据文件（含用户与标签信息，不入库）
+*.csv
+
+# 输出结果
+feature_screening_reports/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Jupyter
+.ipynb_checkpoints/
