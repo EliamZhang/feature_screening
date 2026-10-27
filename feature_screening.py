@@ -400,7 +400,9 @@ def run_feature_screening(root_dir, min_iv=0.02, n_bins=5,
     返回 data, summary, bin_detail, candidates。
     sample_file / variable_file: 根目录下的样本表、变量表文件名。
     target: 标签列；obs_col 为成熟标记列，None 时按 target 自动匹配。
-    feature_prefixes: 参与筛选的列前缀；None 表示变量表除主键外的全部列。
+    feature_prefixes: 参与筛选的列前缀；None 表示变量表除主键和样本表同名列
+        外的全部数值列（非数值列自动跳过），显式传前缀时非数值列会报错。
+        与样本表同名的列（标签、ID 等）始终排除，避免泄漏。
     oot_start / oot_ratio: 仅按 sample_datetime 时间切分，oot_start 优先；
         oot_ratio 取最近的样本占比，切点落在时间点边界上；
         两者都为 None 时不做 OOT 评估。切点只在训练期拟合。
@@ -445,20 +447,36 @@ def run_feature_screening(root_dir, min_iv=0.02, n_bins=5,
         if frame.duplicated(keys).any():
             raise ValueError(name + " 主键重复，请先确认原因，不自动去重。")
 
+    # 变量表可能混入样本表的列（标签、ID 等），一律不作为特征。
+    excluded = [c for c in variables.columns
+                if c in sample_columns and c not in keys]
+    if excluded:
+        print("已排除变量表中与样本表同名的列：{}".format("、".join(excluded)))
     if feature_prefixes is None:
-        features = [c for c in variables.columns if c not in keys]
+        candidates = [c for c in variables.columns
+                      if c not in keys and c not in sample_columns]
+        strict = False
     else:
-        features = [c for c in variables.columns
-                    if c.startswith(tuple(feature_prefixes))]
-    if not features:
-        raise ValueError("变量表没有可用的特征列。")
-    for col in features:
+        candidates = [c for c in variables.columns
+                      if c.startswith(tuple(feature_prefixes))
+                      and c not in sample_columns]
+        strict = True
+    features, skipped = [], []
+    for col in candidates:
         try:
             numeric = pd.to_numeric(variables[col], errors="raise")
         except (ValueError, TypeError) as exc:
-            raise ValueError("特征 {} 含非数值内容，请检查。".format(col)) from exc
+            if strict:
+                raise ValueError("特征 {} 含非数值内容，请检查。".format(col)) from exc
+            skipped.append(col)
+            continue
         default = -1 if col.startswith("bank_txn_lender") else -999999.99999
         variables[col] = numeric.replace([default, np.inf, -np.inf], np.nan)
+        features.append(col)
+    if skipped:
+        print("已跳过非数值列：{}".format("、".join(skipped)))
+    if not features:
+        raise ValueError("变量表没有可用的数值特征列。")
 
     joined = samples.merge(
         variables[keys + features], on=keys, how="left",
