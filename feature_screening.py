@@ -11,7 +11,8 @@
 最优并标记不稳定。缺失值独立成箱，计入整体 IV，不参与单调性和最小箱
 占比判断；缺失箱 IV 占比超过 max_missing_iv_share 的特征不入选。
 最终按 IV（有 OOT 时取训练与 OOT 的较小值）>= min_iv、普通箱坏账率单调、
-OOT 稳定且缺失贡献不超限筛选。
+OOT 稳定且缺失贡献不超限筛选；入选后再按 WOE 相关性贪心去重
+（dedup_corr），剔除与更高 IV 变量高度相关的变量。
 """
 from pathlib import Path
 from datetime import datetime
@@ -165,6 +166,18 @@ def _time_oot_mask(timestamps, ratio):
     mask = np.zeros(len(values), dtype=bool)
     mask[order[position:]] = True
     return mask
+
+
+def _assign_woe(values, detail):
+    """按分箱明细把原始值映射成 WOE；缺失值映射到缺失箱。"""
+    ordinary = detail.loc[~detail["is_missing"]].sort_values("bin_order")
+    upper = ordinary["upper"].to_numpy(dtype=float)
+    index = np.searchsorted(upper[:-1], values.to_numpy(dtype=float), side="left")
+    woe = ordinary["woe"].to_numpy()[index]
+    missing = detail.loc[detail["is_missing"], "woe"]
+    if len(missing):
+        woe = np.where(values.isna().to_numpy(), float(missing.iloc[0]), woe)
+    return woe
 
 
 def auto_monotonic_binning(x, y, n_bins=5, n_prebins=20, min_bin_pct=0.05,
@@ -380,7 +393,8 @@ def run_feature_screening(root_dir, min_iv=0.02, n_bins=5,
                           target="y_fpd15_ovd", obs_col=None,
                           feature_prefixes=FEATURE_PREFIXES,
                           oot_start=None, oot_ratio=0.3,
-                          max_psi=0.25, max_missing_iv_share=0.5):
+                          max_psi=0.25, max_missing_iv_share=0.5,
+                          dedup_corr=0.8):
     """读取指定的样本表/变量表，按指定标签筛选特征。
 
     返回 data, summary, bin_detail, candidates。
@@ -392,6 +406,8 @@ def run_feature_screening(root_dir, min_iv=0.02, n_bins=5,
         两者都为 None 时不做 OOT 评估。切点只在训练期拟合。
     max_psi: OOT 与训练集分箱占比的最大允许 PSI。
     max_missing_iv_share: 缺失箱 IV 占整体 IV 的上限；None 不限制。
+    dedup_corr: 入选变量间 WOE 相关去重阈值（按 iv_min 降序贪心保留）；
+        None 表示不去重。
     min_iv 是 IV 阈值（有 OOT 时取训练与 OOT 的较小值）；
     n_bins/n_prebins/min_bin_pct 控制分箱。
     """
@@ -404,6 +420,8 @@ def run_feature_screening(root_dir, min_iv=0.02, n_bins=5,
         raise ValueError("max_psi 必须为非负有限数值。")
     if max_missing_iv_share is not None and not 0 <= max_missing_iv_share <= 1:
         raise ValueError("max_missing_iv_share 必须在 [0, 1] 内。")
+    if dedup_corr is not None and not 0 < dedup_corr <= 1:
+        raise ValueError("dedup_corr 必须在 (0, 1] 内。")
     keys = ["user_id", "sample_datetime"]
     root = Path(root_dir)
     sample_columns = pd.read_csv(root / sample_file, nrows=0).columns
@@ -523,7 +541,32 @@ def run_feature_screening(root_dir, min_iv=0.02, n_bins=5,
             print("已处理：{}/{}".format(index, len(features)))
 
     summary = pd.DataFrame(rows).sort_values("iv_min", ascending=False).reset_index(drop=True)
+    summary["dedup_with"] = np.nan
     bin_detail = pd.concat(details, ignore_index=True)
+    if dedup_corr is not None:
+        selected_features = summary.loc[summary["selected"], "feature"].tolist()
+        if selected_features:
+            woe_matrix = pd.DataFrame({
+                feature: _assign_woe(
+                    train[feature],
+                    bin_detail.loc[bin_detail["feature"] == feature])
+                for feature in selected_features
+            })
+            corr = woe_matrix.corr(method="spearman").abs()
+            kept, correlated_with = [], {}
+            for feature in selected_features:
+                hits = [k for k in kept if corr.loc[feature, k] >= dedup_corr - TOL]
+                if hits:
+                    correlated_with[feature] = hits[0]
+                else:
+                    kept.append(feature)
+            if correlated_with:
+                dropped = summary["feature"].isin(correlated_with)
+                summary.loc[dropped, "selected"] = False
+                summary.loc[dropped, "reason"] = "与已选变量高相关"
+                summary["dedup_with"] = summary["feature"].map(correlated_with)
+                print("相关性去重：{} -> {}（阈值 {:g}）".format(
+                    len(selected_features), len(kept), dedup_corr))
     candidates = summary.loc[summary["selected"], ["feature"]].reset_index(drop=True)
     candidates["feature"] = candidates["feature"].str.replace("_woe", "", regex=False)
     candidates = candidates.drop_duplicates().reset_index(drop=True)
