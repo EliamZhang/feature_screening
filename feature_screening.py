@@ -71,7 +71,7 @@ _BIN_PALETTE = (
     "#76B7B2", "#EDC948", "#B07AA1", "#FF9DA7",
 )
 
-# 绘图统一字号与分页参数（只影响版式，不影响筛选结果）。
+# 绘图统一字号（只影响版式，不影响筛选结果）。
 _FS_BASE = 9.0
 _FS_TITLE = 14.0
 _FS_HEADER = 9.5
@@ -84,7 +84,6 @@ _FS_CELL_MIN = 7.0
 _FS_CELL_MAX = 8.5
 _FS_FOOTER = 10.0
 _FS_TABLE = 7.8
-_MAX_PERIODS_DEFAULT = 24
 _STACK_HEATMAPS_AFTER = 16
 
 
@@ -1975,7 +1974,7 @@ def _plot_psi_panel(ax, ordered, matrices, periods, period_context,
 
 
 def _feature_plot_limits(analysis, max_psi):
-    """跨分页共享的纵轴和色标范围，保证总览与明细页可直接比较。"""
+    """统一的纵轴和色标范围，保证各面板可直接比较。"""
     matrices = analysis["matrices"]
     meta = analysis["overall_meta"]
     reason = analysis["reason"]
@@ -2017,89 +2016,17 @@ def _feature_plot_limits(analysis, max_psi):
             "psi": psi, "woe": woe, "share": share}
 
 
-def _feature_page_specs(analysis, max_periods):
-    n_periods = int(analysis["period_context"]["n_periods"])
-    max_periods = max(4, int(max_periods))
-    if n_periods <= max_periods:
-        return [{
-            "kind": "single", "label": "all", "start": 0, "end": n_periods,
-            "include_overall": True,
-            "stacked": n_periods > _STACK_HEATMAPS_AFTER,
-            "page_index": 1, "n_pages": 1,
-        }]
-    starts = list(range(0, n_periods, max_periods))
-    specs = [{
-        "kind": "overview", "label": "overview", "start": 0, "end": n_periods,
-        "include_overall": True, "stacked": True,
-        "page_index": 0, "n_pages": len(starts),
-    }]
-    for index, start in enumerate(starts, 1):
-        specs.append({
-            "kind": "detail", "label": "p{:02d}".format(index),
-            "start": start, "end": min(start + max_periods, n_periods),
-            "include_overall": False, "stacked": True,
-            "page_index": index, "n_pages": len(starts),
-        })
-    return specs
-
-
-def _page_period_data(analysis, spec):
-    context = analysis["period_context"]
-    start, end = spec["start"], spec["end"]
-    periods = (context["periods"].iloc[start:end]
-               .reset_index(drop=True))
-    n_periods = end - start
-    matrices = {}
-    for key, value in analysis["matrices"].items():
-        if (isinstance(value, np.ndarray) and value.ndim >= 1
-                and value.shape[0] == context["n_periods"]):
-            matrices[key] = value[start:end]
-        else:
-            matrices[key] = value
-    first_oot = context["first_oot"]
-    if first_oot is not None and not (start <= first_oot < end):
-        first_oot = None
-    elif first_oot is not None:
-        first_oot -= start
-    page_context = {
-        "periods": periods,
-        "codes": context["codes"][start:end],
-        "n_periods": n_periods,
-        "first_oot": first_oot,
-        "gaps": [],
-        "freq": context["freq"],
-    }
-    tick_labels = []
-    for index in range(n_periods):
+def _period_tick_labels(periods, matrices):
+    labels = []
+    for index in range(len(periods)):
         label = str(periods.loc[index, "period_label"])
         coverage = matrices["coverage"][index]
         if np.isfinite(coverage) and coverage < 0.999:
             label += " (cov {:.0%})".format(coverage)
         if periods.loc[index, "split"] == "跨界":
             label += "*"
-        tick_labels.append(label)
-    return periods, matrices, page_context, tick_labels
-
-
-def _page_note(analysis, spec, max_periods):
-    context = analysis["period_context"]
-    n_periods = int(context["n_periods"])
-    periods = context["periods"]
-    first_label = str(periods.loc[spec["start"], "period_label"])
-    last_label = str(periods.loc[spec["end"] - 1, "period_label"])
-    if spec["kind"] == "single":
-        return "Full period: {} periods ({} to {}).".format(
-            _fmt_n(n_periods), first_label, last_label)
-    if spec["kind"] == "overview":
-        return ("Full-period overview: all {} periods ({} to {}); "
-                "{} detail page(s) follow, up to {} periods each.".format(
-                    _fmt_n(n_periods), first_label, last_label,
-                    _fmt_n(spec["n_pages"]), _fmt_n(max_periods)))
-    return ("Period detail {}/{}: periods {}-{} of {} ({} to {}); "
-            "y-axis and color scale match the overview.".format(
-                _fmt_n(spec["page_index"]), _fmt_n(spec["n_pages"]),
-                _fmt_n(spec["start"] + 1), _fmt_n(spec["end"]),
-                _fmt_n(n_periods), first_label, last_label))
+        labels.append(label)
+    return labels
 
 
 def _build_date_meta(train, oot):
@@ -2118,7 +2045,7 @@ def _build_date_meta(train, oot):
     }
 
 
-def _draw_figure_header(fig, analysis, info, params, page_note=None):
+def _draw_figure_header(fig, analysis, info, params):
     meta = analysis["overall_meta"]
     reason = analysis["reason"]
     feature = analysis["feature"]
@@ -2159,10 +2086,8 @@ def _draw_figure_header(fig, analysis, info, params, page_note=None):
         (title, _FS_TITLE, "#111111", "bold"),
         (header_1, _FS_HEADER, "#111111", "normal"),
         (header_2, _FS_HEADER, "#111111", "normal"),
+        (note, _FS_NOTE, "#555555", "normal"),
     ]
-    if page_note:
-        lines.append((page_note, _FS_HEADER, "#1B7F3A", "bold"))
-    lines.append((note, _FS_NOTE, "#555555", "normal"))
     y = 0.992
     for text, fontsize, color, weight in lines:
         y = _add_wrapped_fig_text(fig, 0.012, y, text, fontsize,
@@ -2171,11 +2096,8 @@ def _draw_figure_header(fig, analysis, info, params, page_note=None):
     return max(0.60, min(0.95, y - 0.008))
 
 
-def _layout_feature_figure(fig, include_overall, stacked_heatmaps,
-                           header_bottom):
-    rows = []
-    if include_overall:
-        rows.append(("overall", 4.8))
+def _layout_feature_figure(fig, stacked_heatmaps, header_bottom):
+    rows = [("overall", 4.8)]
     rows.append(("trend_legend", 0.58))
     rows.append(("trend", 2.95))
     if stacked_heatmaps:
@@ -2227,49 +2149,48 @@ def _layout_feature_figure(fig, include_overall, stacked_heatmaps,
     return axes
 
 
-def _render_feature_page(fig, analysis, info, params, plt, spec, limits,
-                         png_path, pdf_path=None):
+def _render_feature_figure(fig, analysis, info, params, plt, limits,
+                           png_path, pdf_path=None):
     overall = analysis["overall"]
     meta = analysis["overall_meta"]
     reason = analysis["reason"]
     short_labels = [_short_bin_label(row.lower, row.upper,
                                      bool(row.is_missing))
                     for row in overall.itertuples()]
-    periods, matrices, page_context, tick_labels = _page_period_data(
-        analysis, spec)
-    header_bottom = _draw_figure_header(
-        fig, analysis, info, params,
-        _page_note(analysis, spec, params["plot_max_periods"]))
-    axes = _layout_feature_figure(
-        fig, spec["include_overall"], spec["stacked"], header_bottom)
+    period_context = analysis["period_context"]
+    periods = period_context["periods"].reset_index(drop=True)
+    matrices = analysis["matrices"]
+    tick_labels = _period_tick_labels(periods, matrices)
+    header_bottom = _draw_figure_header(fig, analysis, info, params)
+    stacked = int(period_context["n_periods"]) > _STACK_HEATMAPS_AFTER
+    axes = _layout_feature_figure(fig, stacked, header_bottom)
 
-    if spec["include_overall"]:
-        handles, labels = _plot_share_panel(
-            axes["share"], axes["table"], overall, meta, info,
-            short_labels, params["plot_min_bin_n"])
-        axes["share_legend"].axis("off")
-        axes["share_legend"].legend(
-            handles, labels, loc="center", ncol=3, frameon=False,
-            fontsize=_FS_LEGEND, handlelength=1.5,
-            columnspacing=1.0, handletextpad=0.5)
-        _plot_woe_panel(axes["woe"], overall, meta, short_labels,
-                        params["plot_min_bin_n"])
-        _plot_iv_panel(axes["iv"], overall, meta, info, short_labels,
-                       params["plot_min_bin_n"], params["plot_iv_floor"])
-        axes["overall_legend"].axis("off")
-        axes["overall_legend"].text(
-            0.5, 0.5,
-            "WOE / IV panels: blue = train, orange = OOT; grey hatch = "
-            "missing bin; red edge = low sample; bars = contribution.",
-            ha="center", va="center", fontsize=_FS_NOTE, color="#555555")
+    handles, labels = _plot_share_panel(
+        axes["share"], axes["table"], overall, meta, info,
+        short_labels, params["plot_min_bin_n"])
+    axes["share_legend"].axis("off")
+    axes["share_legend"].legend(
+        handles, labels, loc="center", ncol=3, frameon=False,
+        fontsize=_FS_LEGEND, handlelength=1.5,
+        columnspacing=1.0, handletextpad=0.5)
+    _plot_woe_panel(axes["woe"], overall, meta, short_labels,
+                    params["plot_min_bin_n"])
+    _plot_iv_panel(axes["iv"], overall, meta, info, short_labels,
+                   params["plot_min_bin_n"], params["plot_iv_floor"])
+    axes["overall_legend"].axis("off")
+    axes["overall_legend"].text(
+        0.5, 0.5,
+        "WOE / IV panels: blue = train, orange = OOT; grey hatch = "
+        "missing bin; red edge = low sample; bars = contribution.",
+        ha="center", va="center", fontsize=_FS_NOTE, color="#555555")
 
     trend_info = dict(info)
     trend_info["_train_bad_rate"] = meta["train_bad_rate"]
     _plot_time_trend(axes["trend"], periods, matrices, trend_info,
-                     page_context, params["plot_min_period_n"],
+                     period_context, params["plot_min_period_n"],
                      tick_labels, limits)
     trend_handles = _trend_legend_handles(
-        page_context["first_oot"] is not None,
+        period_context["first_oot"] is not None,
         bool((matrices["total_n"] < params["plot_min_period_n"]).any()),
         bool((~periods["both_classes"].to_numpy(dtype=bool)).any()),
         bool((~np.isfinite(matrices["period_iv"])).any()))
@@ -2284,13 +2205,13 @@ def _render_feature_page(fig, analysis, info, params, plt, spec, limits,
         columnspacing=0.9, handletextpad=0.5)
 
     _plot_woe_heatmap(axes["woe_heat"], overall, matrices, periods,
-                      page_context, short_labels,
+                      period_context, short_labels,
                       params["plot_min_bin_n"], plt, vlim=limits["woe"])
     _plot_share_heatmap(axes["share_heat"], matrices, periods,
-                        page_context, short_labels, plt,
+                        period_context, short_labels, plt,
                         vmax=limits["share"])
     psi_handles, psi_labels = _plot_psi_panel(
-        axes["psi"], overall, matrices, periods, page_context,
+        axes["psi"], overall, matrices, periods, period_context,
         short_labels, params["max_psi"], ylim=limits["psi"])
     axes["psi_legend"].axis("off")
     axes["psi_legend"].text(
@@ -2316,49 +2237,40 @@ def _render_feature_page(fig, analysis, info, params, plt, spec, limits,
                     bbox_inches="tight", facecolor="white")
 
 
-def _feature_figure_size(spec):
-    if spec["kind"] == "detail":
-        return (17, 21)
-    if spec["stacked"]:
-        return (17, 26)
-    return (17, 23)
+def _feature_figure_size(stacked):
+    return (17, 26) if stacked else (17, 23)
 
 
-def _render_feature_pages(analysis, info, params, plt, plots_dir, file_stem):
-    specs = _feature_page_specs(analysis, params["plot_max_periods"])
-    limits = _feature_plot_limits(analysis, params["max_psi"])
-    results = []
-    for spec in specs:
-        suffix = "" if spec["kind"] == "single" else "_" + spec["label"]
-        png_path = plots_dir / (file_stem + suffix + ".png")
-        pdf_path = (plots_dir / (file_stem + suffix + ".pdf")
-                    if params["plot_pdf"] else None)
-        fig = plt.figure(figsize=_feature_figure_size(spec))
-        try:
-            _render_feature_page(
-                fig, analysis, info, params, plt, spec, limits,
-                png_path, pdf_path)
-            status, error = "成功", ""
-        except Exception as exc:
-            status = "失败"
-            error = "{}: {}".format(type(exc).__name__, exc)
-            for path in (png_path, pdf_path):
-                if path is not None and path.exists():
-                    try:
-                        path.unlink()
-                    except OSError:
-                        pass
-        finally:
-            plt.close(fig)
-        results.append({
-            "page": spec["label"], "png": png_path, "pdf": pdf_path,
-            "status": status, "error": error,
-        })
-    return results
+def _render_feature_plot(analysis, info, params, plt, plots_dir, file_stem):
+    png_path = plots_dir / (file_stem + ".png")
+    pdf_path = (plots_dir / (file_stem + ".pdf")
+                if params["plot_pdf"] else None)
+    stacked = (int(analysis["period_context"]["n_periods"])
+               > _STACK_HEATMAPS_AFTER)
+    fig = plt.figure(figsize=_feature_figure_size(stacked))
+    try:
+        _render_feature_figure(
+            fig, analysis, info, params, plt,
+            _feature_plot_limits(analysis, params["max_psi"]),
+            png_path, pdf_path)
+        status, error = "成功", ""
+    except Exception as exc:
+        status = "失败"
+        error = "{}: {}".format(type(exc).__name__, exc)
+        for path in (png_path, pdf_path):
+            if path is not None and path.exists():
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+    finally:
+        plt.close(fig)
+    return {"png": png_path, "pdf": pdf_path,
+            "status": status, "error": error}
 
 
 _INDEX_COLUMNS = [
-    "original_feature", "export_name", "page", "plot_png", "plot_pdf",
+    "original_feature", "export_name", "plot_png", "plot_pdf",
     "plot_status", "plot_error", "candidate_reason",
     "name_collision", "collision_group",
 ]
@@ -2411,23 +2323,12 @@ def _setup_matplotlib():
     return plt
 
 
-def _fallback_page_results(analysis, params, plots_dir, file_stem, error):
-    """渲染进程异常时，为每个预期分页生成一条失败记录。"""
-    try:
-        specs = _feature_page_specs(analysis, params["plot_max_periods"])
-    except Exception:
-        specs = [{"kind": "single", "label": "all"}]
-    results = []
-    for spec in specs:
-        suffix = "" if spec["kind"] == "single" else "_" + spec["label"]
-        png_path = plots_dir / (file_stem + suffix + ".png")
-        pdf_path = (plots_dir / (file_stem + suffix + ".pdf")
-                    if params["plot_pdf"] else None)
-        results.append({
-            "page": spec["label"], "png": png_path, "pdf": pdf_path,
-            "status": "失败", "error": error,
-        })
-    return results
+def _fallback_plot_result(params, plots_dir, file_stem, error):
+    png_path = plots_dir / (file_stem + ".png")
+    pdf_path = (plots_dir / (file_stem + ".pdf")
+                if params["plot_pdf"] else None)
+    return {"png": png_path, "pdf": pdf_path,
+            "status": "失败", "error": error}
 
 
 def _render_feature_task(payload):
@@ -2436,10 +2337,10 @@ def _render_feature_task(payload):
     try:
         plt = _setup_matplotlib()
     except Exception as exc:
-        return _fallback_page_results(
-            analysis, params, plots_dir, file_stem,
+        return _fallback_plot_result(
+            params, plots_dir, file_stem,
             "{}: {}".format(type(exc).__name__, exc))
-    return _render_feature_pages(
+    return _render_feature_plot(
         analysis, info, params, plt, plots_dir, file_stem)
 
 
@@ -2515,14 +2416,8 @@ def generate_feature_analysis_plots(data, train, oot, target, summary,
         print("  时间缺口 {} 个，明细见 time_bin_detail.csv".format(
             len(period_context["gaps"])))
 
-    max_periods = int(params.get("plot_max_periods", _MAX_PERIODS_DEFAULT))
     n_periods = int(period_context["n_periods"])
-    if n_periods > max_periods:
-        n_pages = int(np.ceil(n_periods / float(max_periods)))
-        print("  周期超过 {} 个，将输出 1 张全周期总览 + {} 张分页明细"
-              .format(max_periods, n_pages))
-    else:
-        print("  单页输出（每页不超过 {} 个周期）".format(max_periods))
+    print("  单张图输出（全部 {} 个周期）".format(n_periods))
 
     export_names = {
         feature: str(feature).replace("_woe", "") for feature in plot_targets}
@@ -2542,11 +2437,8 @@ def generate_feature_analysis_plots(data, train, oot, target, summary,
         item = {
             "position": position, "feature": feature,
             "export_name": export_name, "file_stem": file_stem,
-            "fallback_png": plots_dir / (file_stem + ".png"),
-            "fallback_pdf": (plots_dir / (file_stem + ".pdf")
-                             if params["plot_pdf"] else None),
             "info": info_map.get(feature, {}),
-            "analysis": None, "reason": None, "page_results": None,
+            "analysis": None, "reason": None, "plot_result": None,
         }
         try:
             detail = detail_groups.get(feature)
@@ -2571,11 +2463,8 @@ def generate_feature_analysis_plots(data, train, oot, target, summary,
             item["reason"] = {
                 "candidate_reason": "Analysis failed: {}".format(error),
             }
-            item["page_results"] = [{
-                "page": "all", "png": item["fallback_png"],
-                "pdf": item["fallback_pdf"], "status": "失败",
-                "error": error,
-            }]
+            item["plot_result"] = _fallback_plot_result(
+                params, plots_dir, file_stem, error)
         items.append(item)
 
     plot_jobs = int(params.get("plot_n_jobs", 1) or 1)
@@ -2600,11 +2489,10 @@ def generate_feature_analysis_plots(data, train, oot, target, summary,
                     index = pending[future]
                     item = items[index]
                     try:
-                        item["page_results"] = future.result()
+                        item["plot_result"] = future.result()
                     except Exception as exc:
-                        item["page_results"] = _fallback_page_results(
-                            item["analysis"], params, plots_dir,
-                            item["file_stem"],
+                        item["plot_result"] = _fallback_plot_result(
+                            params, plots_dir, item["file_stem"],
                             "{}: {}".format(type(exc).__name__, exc))
                     if done % 10 == 0 or done == len(pending):
                         print("分析绘图：{}/{}".format(done, len(pending)))
@@ -2616,15 +2504,15 @@ def generate_feature_analysis_plots(data, train, oot, target, summary,
         total_analyses = sum(
             entry["analysis"] is not None for entry in items)
         for item in items:
-            if item["analysis"] is None or item["page_results"] is not None:
+            if item["analysis"] is None or item["plot_result"] is not None:
                 continue
             try:
-                item["page_results"] = _render_feature_pages(
+                item["plot_result"] = _render_feature_plot(
                     item["analysis"], item["info"], params, plt, plots_dir,
                     item["file_stem"])
             except Exception as exc:
-                item["page_results"] = _fallback_page_results(
-                    item["analysis"], params, plots_dir, item["file_stem"],
+                item["plot_result"] = _fallback_plot_result(
+                    params, plots_dir, item["file_stem"],
                     "{}: {}".format(type(exc).__name__, exc))
             done += 1
             if done % 10 == 0 or done == total_analyses:
@@ -2634,30 +2522,27 @@ def generate_feature_analysis_plots(data, train, oot, target, summary,
         if item.get("time_detail") is not None:
             time_rows.append(item["time_detail"])
         reason = item["reason"] or {"candidate_reason": ""}
-        page_results = item["page_results"] or []
-        page_errors = [result["error"] for result in page_results
-                       if result["status"] != "成功"]
-        if page_errors:
-            message = "; ".join(page_errors)
-            failures.append((item["feature"], message))
+        plot_result = item["plot_result"]
+        if plot_result is None:
+            continue
+        if plot_result["status"] != "成功":
+            failures.append((item["feature"], plot_result["error"]))
             print("警告：特征 {} 绘图失败：{}".format(
-                item["feature"], message))
-        for page_result in page_results:
-            pdf_path = page_result["pdf"]
-            index_rows.append({
-                "original_feature": item["feature"],
-                "export_name": item["export_name"],
-                "page": page_result["page"],
-                "plot_png": str(page_result["png"]),
-                "plot_pdf": str(pdf_path) if pdf_path is not None else "",
-                "plot_status": page_result["status"],
-                "plot_error": page_result["error"],
-                "candidate_reason": reason["candidate_reason"],
-                "name_collision": item["export_name"] in collision_groups,
-                "collision_group": (item["export_name"]
-                                    if item["export_name"] in collision_groups
-                                    else ""),
-            })
+                item["feature"], plot_result["error"]))
+        pdf_path = plot_result["pdf"]
+        index_rows.append({
+            "original_feature": item["feature"],
+            "export_name": item["export_name"],
+            "plot_png": str(plot_result["png"]),
+            "plot_pdf": str(pdf_path) if pdf_path is not None else "",
+            "plot_status": plot_result["status"],
+            "plot_error": plot_result["error"],
+            "candidate_reason": reason["candidate_reason"],
+            "name_collision": item["export_name"] in collision_groups,
+            "collision_group": (item["export_name"]
+                                if item["export_name"] in collision_groups
+                                else ""),
+        })
     index_frame = pd.DataFrame(index_rows, columns=_INDEX_COLUMNS)
     time_frame = (pd.concat(time_rows, ignore_index=True)
                   if time_rows else empty_time)
@@ -2703,7 +2588,6 @@ def run_feature_screening(root_dir, min_iv=0.02, n_bins=5,
                           dedup_corr=0.8,
                           plot_results=True, plot_features=None,
                           plot_pdf=False, plot_dpi=200,
-                          plot_max_periods=24,
                           time_freq="week",
                           plot_min_bin_n=30, plot_min_bin_good=5,
                           plot_min_bin_bad=5, plot_min_period_n=100,
@@ -2739,8 +2623,7 @@ def run_feature_screening(root_dir, min_iv=0.02, n_bins=5,
         None 或空列表表示画最终候选。未进入筛选结果的变量会跳过并提示。
     plot_pdf: 是否同时导出 PDF；默认只导出 PNG。
     plot_dpi: PNG 分辨率，默认 200，支持 200~300。
-    plot_max_periods: 每页最多展示的时间段数量，默认 24；超过时先输出
-        一张全周期总览，再按该上限输出分页明细，各页共用纵轴和色标。
+    每个特征固定输出一张图，包含全部时间段。
     time_freq: 分期粒度 day/week/month，默认 week；一次运行内所有特征一致。
     plot_min_bin_n / plot_min_bin_good / plot_min_bin_bad: 图中标记
         低样本箱的阈值（样本量、好样本、坏样本），默认 30/5/5。
@@ -2776,9 +2659,6 @@ def run_feature_screening(root_dir, min_iv=0.02, n_bins=5,
         raise ValueError("time_freq 只能是 day、week 或 month。")
     if not isinstance(plot_dpi, (int, np.integer)) or not 72 <= plot_dpi <= 600:
         raise ValueError("plot_dpi 必须是 72~600 的整数。")
-    if (not isinstance(plot_max_periods, (int, np.integer))
-            or not 4 <= plot_max_periods <= 200):
-        raise ValueError("plot_max_periods 必须是 4~200 的整数。")
     for name, value, allow_none in [
             ("n_jobs", n_jobs, False),
             ("plot_n_jobs", plot_n_jobs, False),
@@ -3041,7 +2921,6 @@ def run_feature_screening(root_dir, min_iv=0.02, n_bins=5,
             "plot_n_jobs": int(plot_n_jobs),
             "plot_pdf": bool(plot_pdf),
             "plot_dpi": int(plot_dpi),
-            "plot_max_periods": int(plot_max_periods),
             "time_freq": time_freq,
             "plot_min_bin_n": int(plot_min_bin_n),
             "plot_min_bin_good": int(plot_min_bin_good),
