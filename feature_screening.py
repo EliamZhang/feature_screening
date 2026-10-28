@@ -1384,8 +1384,8 @@ def _plot_share_panel(ax, ax_table, ordered, meta, info, short_labels,
                  if oot_enabled else "Bin share and bad rate (train only)",
                  fontsize=_FS_PANEL_TITLE, loc="left", pad=8)
     ax.text(0.01, 0.98,
-            "Bars = sample share; line = bad rate (95% Wilson CI); "
-            "grey hatch = missing bin; red edge = low sample.",
+            "Bars = sample share; line = bad rate (95% Wilson CI)\n"
+            "Grey hatch = missing bin; red edge = low sample.",
             transform=ax.transAxes, fontsize=_FS_NOTE, color="#555555",
             va="top", bbox=dict(facecolor="white", alpha=0.86,
                                 edgecolor="none", pad=1.2), zorder=6)
@@ -1515,7 +1515,7 @@ def _plot_woe_panel(ax, ordered, meta, short_labels, min_bin_n):
                        fontsize=_FS_TICK)
     ax.tick_params(axis="x", pad=4)
     ax.set_ylabel("WOE", fontsize=_FS_AXIS_LABEL)
-    ax.set_title("Bin WOE (positive = lower relative risk, negative = higher)",
+    ax.set_title("Bin WOE (positive = lower risk, negative = higher risk)",
                  fontsize=_FS_PANEL_TITLE, loc="left", pad=8)
     ax.text(0.01, 0.98, "WOE = ln(good share / bad share)",
             transform=ax.transAxes, fontsize=_FS_NOTE, color="#555555",
@@ -1906,8 +1906,10 @@ def _plot_psi_panel(ax, ordered, matrices, periods, period_context,
                    label="Low-sample PSI (not used)")
     ax.axhline(max_psi, color=_THRESHOLD_COLOR, ls="--", lw=1.0,
                label="Threshold {:g}".format(max_psi), zorder=3)
+    max_index = None
     if np.isfinite(reliable_psi).any():
         index = int(np.nanargmax(reliable_psi))
+        max_index = index
         ax.scatter([x[index]], [reliable_psi[index]], s=48,
                    facecolors="none", edgecolors="#222222", zorder=5)
         if n_periods <= 12:
@@ -1929,20 +1931,27 @@ def _plot_psi_panel(ax, ordered, matrices, periods, period_context,
     upper = float(ylim) if ylim is not None else local_upper
     if n_periods <= 12:
         for index in range(n_periods):
+            if index == max_index:
+                continue
             if np.isfinite(period_psi[index]) and not low_period[index]:
                 ax.text(index, bottom[index],
                         _fmt_float(period_psi[index], 4),
                         ha="center", va="bottom",
                         fontsize=_FS_CELL_MIN, color="#333333")
-    for index in np.flatnonzero(low_finite):
+    overflow = [int(index) for index in np.flatnonzero(low_finite)
+                if period_psi[index] > upper]
+    if len(overflow) > 8:
+        overflow = sorted(overflow,
+                          key=lambda index: -period_psi[index])[:8]
+    for order, index in enumerate(sorted(overflow)):
         value = period_psi[index]
-        if value > upper:
-            ax.annotate(_fmt_float(value, 4),
-                        xy=(x[index], upper * 0.96),
-                        xytext=(x[index], upper * 0.82), ha="center",
-                        fontsize=_FS_CELL_MIN, color=_THRESHOLD_COLOR,
-                        arrowprops=dict(arrowstyle="-|>",
-                                        color=_THRESHOLD_COLOR, lw=0.6))
+        y_text = upper * (0.82 - 0.13 * (order % 3))
+        ax.annotate(_fmt_float(value, 4),
+                    xy=(x[index], upper * 0.96),
+                    xytext=(x[index], y_text), ha="center",
+                    fontsize=_FS_CELL_MIN, color=_THRESHOLD_COLOR,
+                    arrowprops=dict(arrowstyle="-|>",
+                                    color=_THRESHOLD_COLOR, lw=0.6))
     positions = _period_tick_positions(n_periods, 14)
     labels = [str(periods.loc[index, "period_label"]) for index in positions]
     ax.set_xticks(x[positions])
@@ -2099,30 +2108,33 @@ def _draw_figure_header(fig, analysis, info, params):
 
 
 def _layout_feature_figure(fig, stacked_heatmaps, header_bottom):
-    rows = [("overall", 4.8)]
-    rows.append(("trend_legend", 0.58))
-    rows.append(("trend", 2.95))
+    # 显式间隔行代替统一 hspace：旋转日期标签、热力图说明需要的留白不同。
+    rows = [("overall", 6.40), ("spacer", 0.35), ("trend_legend", 0.35),
+            ("trend", 2.60), ("spacer", 1.15)]
     if stacked_heatmaps:
-        rows.append(("woe_heat", 2.35))
-        rows.append(("share_heat", 2.35))
+        rows.append(("woe_heat", 2.20))
+        rows.append(("spacer", 1.05))
+        rows.append(("share_heat", 2.20))
     else:
-        rows.append(("heat", 2.95))
-    rows.append(("psi_legend", 0.58))
-    rows.append(("psi", 2.35))
-    rows.append(("reason", 1.05))
+        rows.append(("heat", 2.35))
+    rows.append(("spacer", 1.45))
+    rows.append(("psi_legend", 0.35))
+    rows.append(("psi", 2.10))
+    rows.append(("spacer", 0.60))
+    rows.append(("reason", 0.80))
     heights = [row[1] for row in rows]
     grid = fig.add_gridspec(
         len(rows), 6, height_ratios=heights,
-        hspace=0.56, wspace=0.36, left=0.055, right=0.965,
+        hspace=0.0, wspace=0.36, left=0.055, right=0.965,
         top=header_bottom, bottom=0.025)
     axes = {}
     for index, (name, _) in enumerate(rows):
         if name == "overall":
             overall_wrap = grid[index, :].subgridspec(
-                2, 1, height_ratios=[5.2, 0.38], hspace=0.16)
+                2, 1, height_ratios=[5.6, 0.35], hspace=0.12)
             overall_grid = overall_wrap[0].subgridspec(1, 3, wspace=0.38)
             left_grid = overall_grid[0].subgridspec(
-                3, 1, height_ratios=[3.5, 0.45, 1.30], hspace=0.18)
+                3, 1, height_ratios=[4.2, 0.52, 1.25], hspace=0.50)
             axes["share"] = fig.add_subplot(left_grid[0])
             axes["share_legend"] = fig.add_subplot(left_grid[1])
             axes["table"] = fig.add_subplot(left_grid[2])
