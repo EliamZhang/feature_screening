@@ -429,13 +429,26 @@ def _fmt_pct(value, digits=1):
     return ("{:." + str(digits) + "%}").format(float(value))
 
 
+_DIRECTION_EN = {
+    "递增": "increasing",
+    "递减": "decreasing",
+    "持平": "flat",
+    "单普通箱，免检": "single bin",
+    "全缺失": "all missing",
+}
+
+
+def _direction_en(value):
+    return _DIRECTION_EN.get(str(value), str(value))
+
+
 def _short_bin_label(lower, upper, is_missing, digits=4):
     """图内使用的短区间标签；完整切点保留在明细 CSV。"""
     if is_missing:
-        return "缺失"
+        return "Missing"
     fmt = "{:." + str(digits) + "g}"
     if lower == -np.inf:
-        return "≤" + fmt.format(upper)
+        return "<=" + fmt.format(upper)
     if upper == np.inf:
         return ">" + fmt.format(lower)
     return "({}, {}]".format(fmt.format(lower), fmt.format(upper))
@@ -842,37 +855,39 @@ def _build_candidate_reason(overall, overall_meta, info, period_context,
     parts = []
     if train_dir in ("递增", "递减"):
         if oot_enabled and info.get("oot_is_monotonic"):
-            parts.append("训练/OOT 均单调{}".format(train_dir))
+            parts.append("Train/OOT both monotonic {}".format(
+                _direction_en(train_dir)))
         else:
-            parts.append("训练单调{}".format(train_dir))
+            parts.append("Train monotonic {}".format(_direction_en(train_dir)))
     elif train_dir == "持平":
-        parts.append("普通箱坏账率持平")
+        parts.append("Ordinary-bin bad rate flat")
     elif train_dir == "单普通箱，免检":
-        parts.append("仅 1 个普通箱，无单调方向")
+        parts.append("Only one ordinary bin; no monotonic direction")
     else:
-        parts.append("训练方向={}".format(train_dir))
+        parts.append("Train direction={}".format(_direction_en(train_dir)))
     if oot_enabled:
-        parts.append("训练 IV={}、OOT IV={}，iv_min={} ≥ {}".format(
+        parts.append("Train IV={}, OOT IV={}, iv_min={} >= {}".format(
             _fmt_float(iv_train), _fmt_float(iv_oot), _fmt_float(iv_min),
             _fmt_float(params["min_iv"])))
-        parts.append("OOT PSI={} ≤ {}".format(
+        parts.append("OOT PSI={} <= {}".format(
             _fmt_float(info.get("psi", np.nan)),
             _fmt_float(params["max_psi"])))
     else:
-        parts.append("训练 IV={} ≥ {}".format(
+        parts.append("Train IV={} >= {}".format(
             _fmt_float(iv_train), _fmt_float(params["min_iv"])))
-        parts.append("未启用 OOT")
+        parts.append("OOT disabled")
     if params["max_missing_iv_share"] is None:
-        parts.append("缺失箱 IV 占比={}".format(_fmt_pct(missing_share)))
+        parts.append("Missing-bin IV share={}".format(
+            _fmt_pct(missing_share)))
     else:
-        parts.append("缺失箱 IV 占比={} ≤ {:.0%}".format(
+        parts.append("Missing-bin IV share={} <= {:.0%}".format(
             _fmt_pct(missing_share), params["max_missing_iv_share"]))
     if params.get("dedup_corr") is not None:
-        parts.append("已通过 WOE 相关性去重（阈值 {:g}）".format(
+        parts.append("Passed WOE correlation dedup (threshold {:g})".format(
             params["dedup_corr"]))
     else:
-        parts.append("未启用相关性去重")
-    candidate_reason = "纳入候选原因：" + "；".join(parts) + "。"
+        parts.append("Correlation dedup disabled")
+    candidate_reason = "Candidate reason: " + "; ".join(parts) + "."
 
     iv_change_pct = (
         (iv_oot / iv_train - 1.0) * 100.0
@@ -938,10 +953,6 @@ def _text_display_width(text):
     return float(sum(2.0 if ord(char) > 127 else 1.0 for char in str(text)))
 
 
-def _fmt_rate(value):
-    return "{:.1%}".format(value) if np.isfinite(value) else "NA"
-
-
 def _plot_share_panel(ax, ax_table, ordered, meta, info, short_labels,
                       min_bin_n):
     oot_enabled = meta["oot_enabled"]
@@ -953,7 +964,7 @@ def _plot_share_panel(ax, ax_table, ordered, meta, info, short_labels,
     bars_train = ax.bar(
         x - (width / 2.0 if oot_enabled else 0.0), share_train, width,
         color=_TRAIN_COLOR, alpha=0.82, edgecolor="white",
-        linewidth=0.6, label="训练占比", zorder=2)
+        linewidth=0.6, label="Train share", zorder=2)
     bars_oot = None
     if oot_enabled:
         oot_total = max(meta["oot_total"], 1)
@@ -961,7 +972,7 @@ def _plot_share_panel(ax, ax_table, ordered, meta, info, short_labels,
         bars_oot = ax.bar(
             x + width / 2.0, share_oot, width, color=_OOT_COLOR,
             alpha=0.72, edgecolor="white", linewidth=0.6,
-            label="OOT 占比", zorder=2)
+            label="OOT share", zorder=2)
     is_missing = ordered["is_missing"].to_numpy(dtype=bool)
     for index in range(count):
         for bars, values in [(bars_train, ordered["n"].to_numpy(dtype=float)),
@@ -977,7 +988,7 @@ def _plot_share_panel(ax, ax_table, ordered, meta, info, short_labels,
             if values is not None and 0 < values[index] < min_bin_n:
                 patch.set_edgecolor(_THRESHOLD_COLOR)
                 patch.set_linewidth(1.3)
-    ax.set_ylabel("样本占比 (%)", fontsize=8)
+    ax.set_ylabel("Sample share (%)", fontsize=8)
     ax.set_xticks(x)
     ax.set_xticklabels(short_labels, rotation=18, ha="right", fontsize=7)
     upper = np.nanmax(share_train) if np.isfinite(share_train).any() else 10.0
@@ -987,10 +998,10 @@ def _plot_share_panel(ax, ax_table, ordered, meta, info, short_labels,
         if np.isfinite(oot_share).any():
             upper = max(upper, float(np.nanmax(oot_share)))
     ax.set_ylim(0, max(upper * 1.28, 5.0))
-    ax.set_title("分箱占比与坏账率（训练为主，OOT 对照）"
-                 if oot_enabled else "分箱占比与坏账率（仅训练）",
+    ax.set_title("Bin share and bad rate (train vs OOT)"
+                 if oot_enabled else "Bin share and bad rate (train only)",
                  fontsize=9, loc="left")
-    ax.text(0.01, 0.98, "柱=样本占比；线=坏账率（95% Wilson CI）",
+    ax.text(0.01, 0.98, "Bars = sample share; line = bad rate (95% Wilson CI)",
             transform=ax.transAxes, fontsize=6.8, color="#555555",
             va="top")
     ax2 = ax.twinx()
@@ -998,7 +1009,7 @@ def _plot_share_panel(ax, ax_table, ordered, meta, info, short_labels,
     train_rate = ordered["bad_rate"].to_numpy(dtype=float) * 100.0
     valid = ordinary & np.isfinite(train_rate)
     ax2.plot(x[valid], train_rate[valid], color=_TRAIN_COLOR,
-             marker="o", lw=1.7, label="训练坏账率", zorder=3)
+             marker="o", lw=1.7, label="Train bad rate", zorder=3)
     ax2.errorbar(
         x[valid], train_rate[valid],
         yerr=_rate_yerr(train_rate[valid],
@@ -1010,12 +1021,12 @@ def _plot_share_panel(ax, ax_table, ordered, meta, info, short_labels,
     if missing_mask.any():
         ax2.scatter(x[missing_mask], train_rate[missing_mask],
                     color=_TRAIN_COLOR, marker="D", s=26, zorder=4,
-                    label="训练缺失箱")
+                    label="Train missing bin")
     if oot_enabled:
         oot_rate = ordered["oot_bad_rate"].to_numpy(dtype=float) * 100.0
         oot_valid = ordinary & np.isfinite(oot_rate)
         ax2.plot(x[oot_valid], oot_rate[oot_valid], color=_OOT_COLOR,
-                 marker="s", lw=1.4, ls="--", label="OOT 坏账率", zorder=3)
+                 marker="s", lw=1.4, ls="--", label="OOT bad rate", zorder=3)
         ax2.errorbar(
             x[oot_valid], oot_rate[oot_valid],
             yerr=_rate_yerr(
@@ -1028,13 +1039,13 @@ def _plot_share_panel(ax, ax_table, ordered, meta, info, short_labels,
         if oot_missing.any():
             ax2.scatter(x[oot_missing], oot_rate[oot_missing],
                         color=_OOT_COLOR, marker="D", s=22, zorder=4,
-                        label="OOT 缺失箱")
+                        label="OOT missing bin")
     ax2.axhline(meta["train_bad_rate"] * 100.0, color=_TRAIN_COLOR,
-                ls=":", lw=1.0, alpha=0.7, label="训练整体坏账率")
+                ls=":", lw=1.0, alpha=0.7, label="Train overall bad rate")
     if oot_enabled:
         ax2.axhline(meta["oot_bad_rate"] * 100.0, color=_OOT_COLOR,
-                    ls=":", lw=1.0, alpha=0.7, label="OOT 整体坏账率")
-    ax2.set_ylabel("坏账率 (%)", fontsize=8)
+                    ls=":", lw=1.0, alpha=0.7, label="OOT overall bad rate")
+    ax2.set_ylabel("Bad rate (%)", fontsize=8)
     max_rate = np.nanmax(train_rate) if np.isfinite(train_rate).any() else 10.0
     if oot_enabled:
         oot_rate_all = ordered["oot_bad_rate"].to_numpy(dtype=float) * 100.0
@@ -1049,22 +1060,18 @@ def _plot_share_panel(ax, ax_table, ordered, meta, info, short_labels,
     ax_table.axis("off")
     row_labels, cell_text = [], []
     if oot_enabled:
-        row_labels = ["训练 n", "训练 坏", "训练 坏账率",
-                      "OOT n", "OOT 坏", "OOT 坏账率"]
+        row_labels = ["Train n", "Train bad", "OOT n", "OOT bad"]
         cell_text = [
             [_fmt_n(value) for value in ordered["n"]],
             [_fmt_n(value) for value in ordered["bad"]],
-            [_fmt_rate(value) for value in ordered["bad_rate"]],
             [_fmt_n(value) for value in ordered["oot_n"]],
             [_fmt_n(value) for value in ordered["oot_bad"]],
-            [_fmt_rate(value) for value in ordered["oot_bad_rate"]],
         ]
     else:
-        row_labels = ["训练 n", "训练 坏", "训练 坏账率"]
+        row_labels = ["Train n", "Train bad"]
         cell_text = [
             [_fmt_n(value) for value in ordered["n"]],
             [_fmt_n(value) for value in ordered["bad"]],
-            [_fmt_rate(value) for value in ordered["bad_rate"]],
         ]
     table = ax_table.table(cellText=cell_text, rowLabels=row_labels,
                            colLabels=short_labels, loc="center",
@@ -1078,7 +1085,7 @@ def _plot_share_panel(ax, ax_table, ordered, meta, info, short_labels,
             cell.set_text_props(weight="bold")
         if col >= 0 and is_missing[col]:
             cell.set_facecolor("#F2F2F2")
-    ax_table.set_title("分箱明细（n=样本量，坏=坏样本量）",
+    ax_table.set_title("Bin detail (n = samples, bad = bad samples)",
                        fontsize=7.2, pad=1.5)
 
 
@@ -1089,7 +1096,7 @@ def _plot_woe_panel(ax, ordered, meta, short_labels, min_bin_n):
     train_woe = ordered["woe"].to_numpy(dtype=float)
     bars_train = ax.bar(
         x - (width / 2.0 if meta["oot_enabled"] else 0.0), train_woe,
-        width, color=_TRAIN_COLOR, alpha=0.82, label="训练 WOE", zorder=2)
+        width, color=_TRAIN_COLOR, alpha=0.82, label="Train WOE", zorder=2)
     bars_oot = None
     if meta["oot_enabled"]:
         bars_oot = ax.bar(
@@ -1114,9 +1121,9 @@ def _plot_woe_panel(ax, ordered, meta, short_labels, min_bin_n):
     ax.set_xticks(x)
     ax.set_xticklabels(short_labels, rotation=18, ha="right", fontsize=7)
     ax.set_ylabel("WOE", fontsize=8)
-    ax.set_title("分箱 WOE（正=相对风险低，负=相对风险高）",
+    ax.set_title("Bin WOE (positive = lower relative risk, negative = higher)",
                  fontsize=9, loc="left")
-    ax.text(0.01, 0.98, "WOE=ln(好样本占比/坏样本占比)",
+    ax.text(0.01, 0.98, "WOE = ln(good share / bad share)",
             transform=ax.transAxes, fontsize=6.8, color="#555555",
             va="top")
     if count <= 8:
@@ -1150,12 +1157,14 @@ def _plot_iv_panel(ax, ordered, meta, info, short_labels, min_bin_n,
     train_iv = ordered["iv_part"].to_numpy(dtype=float)
     bars_train = ax.bar(
         x - (width / 2.0 if meta["oot_enabled"] else 0.0), train_iv,
-        width, color=_TRAIN_COLOR, alpha=0.82, label="训练 IV 贡献", zorder=2)
+        width, color=_TRAIN_COLOR, alpha=0.82, label="Train IV contribution",
+        zorder=2)
     bars_oot = None
     if meta["oot_enabled"]:
         bars_oot = ax.bar(
             x + width / 2.0, ordered["oot_iv_part"].to_numpy(dtype=float),
-            width, color=_OOT_COLOR, alpha=0.75, label="OOT IV 贡献", zorder=2)
+            width, color=_OOT_COLOR, alpha=0.75, label="OOT IV contribution",
+            zorder=2)
     is_missing = ordered["is_missing"].to_numpy(dtype=bool)
     train_n = ordered["n"].to_numpy(dtype=float)
     oot_n = (ordered["oot_n"].to_numpy(dtype=float)
@@ -1178,21 +1187,21 @@ def _plot_iv_panel(ax, ordered, meta, info, short_labels, min_bin_n,
         bars_train[max_index].set_linewidth(2.0)
     ax.set_xticks(x)
     ax.set_xticklabels(short_labels, rotation=18, ha="right", fontsize=7)
-    ax.set_ylabel("IV 贡献", fontsize=8)
-    ax.set_title("IV 贡献（训练 vs OOT）" if meta["oot_enabled"]
-                 else "IV 贡献（仅训练，未启用 OOT）",
+    ax.set_ylabel("IV contribution", fontsize=8)
+    ax.set_title("IV contribution (train vs OOT)" if meta["oot_enabled"]
+                 else "IV contribution (train only, OOT disabled)",
                  fontsize=9, loc="left")
-    caption = "训练 IV={}；OOT IV={}；缺失箱占比 {}".format(
+    caption = "Train IV={}; OOT IV={}; missing-bin share {}".format(
         _fmt_float(info.get("iv", np.nan)),
         _fmt_float(info.get("oot_iv", np.nan)),
         _fmt_pct(info.get("iv_missing_share", np.nan)))
     if np.isfinite(iv_train) and iv_train > iv_floor:
         max_index = int(np.nanargmax(train_iv))
-        caption += "\n最大贡献箱 {}（n={}，占训练 IV {:.1%}）".format(
+        caption += "\nTop bin {} (n={}, {:.1%} of train IV)".format(
             short_labels[max_index], int(train_n[max_index]),
             train_iv[max_index] / iv_train)
         if 0 < train_n[max_index] < min_bin_n:
-            caption += "；该箱样本少，贡献集中需谨慎"
+            caption += "; small bin, concentrated contribution"
     ax.text(0.01, 0.98, caption, transform=ax.transAxes, fontsize=6.6,
             color="#555555", va="top", linespacing=1.35)
     if np.isfinite(iv_train) and iv_train > iv_floor:
@@ -1205,7 +1214,7 @@ def _plot_iv_panel(ax, ordered, meta, info, short_labels, min_bin_n,
                     value, "{:.1%}".format(share), ha="center",
                     va="bottom", fontsize=6)
     else:
-        ax.text(0.5, 0.55, "IV≈0，贡献比例不稳定，不展示占比",
+        ax.text(0.5, 0.55, "IV~0: contribution share unstable, hidden",
                 transform=ax.transAxes, ha="center", fontsize=8,
                 color=_THRESHOLD_COLOR)
     ax.legend(fontsize=6.8, loc="upper right")
@@ -1217,15 +1226,15 @@ def _plot_iv_panel(ax, ordered, meta, info, short_labels, min_bin_n,
 
 
 def _plot_time_trend(axes, periods, matrices, info, period_context,
-                     max_psi, min_period_n, tick_labels):
+                     min_period_n, tick_labels):
     n_periods = len(periods)
     x = np.arange(n_periods)
-    ax_n, ax_bad, ax_iv, ax_psi = axes
+    ax_n, ax_bad, ax_iv = axes
     oot_enabled = period_context["first_oot"] is not None
     for axis in axes:
         _draw_period_overlay(axis, periods, period_context["first_oot"])
     ax_n.bar(x, periods["n_train"].to_numpy(dtype=float),
-             color=_TRAIN_COLOR, alpha=0.82, label="训练", zorder=2)
+             color=_TRAIN_COLOR, alpha=0.82, label="Train", zorder=2)
     if oot_enabled:
         ax_n.bar(x, periods["n_oot"].to_numpy(dtype=float),
                  bottom=periods["n_train"].to_numpy(dtype=float),
@@ -1235,15 +1244,15 @@ def _plot_time_trend(axes, periods, matrices, info, period_context,
         ax_n.scatter(x[low_period],
                      periods["n_total"].to_numpy(dtype=float)[low_period],
                      marker="v", s=24, color=_THRESHOLD_COLOR, zorder=4,
-                     label="低样本期")
-    ax_n.set_ylabel("样本量", fontsize=7.5)
+                     label="Low-sample period")
+    ax_n.set_ylabel("Samples", fontsize=7.5)
     ax_n.set_title(
-        "分期趋势（固定训练分箱）：样本量 / 坏账率 / IV / PSI",
+        "Period trend (fixed train bins): samples / bad rate / IV",
         fontsize=9, loc="left")
     ax_n.legend(fontsize=6.2, loc="upper right", ncol=3)
     if period_context["first_oot"] is not None:
         ax_n.text(period_context["first_oot"] - 0.5,
-                  ax_n.get_ylim()[1] * 0.96, " 训练/OOT 切点",
+                  ax_n.get_ylim()[1] * 0.96, " Train/OOT split",
                   fontsize=6.6, va="top", color="#333333")
 
     bad_rate = matrices["bad_rate"] * 100.0
@@ -1252,7 +1261,7 @@ def _plot_time_trend(axes, periods, matrices, info, period_context,
     low, high = _wilson_interval(mapped_bad, mapped_n)
     valid = periods["both_classes"].to_numpy(dtype=bool) & np.isfinite(bad_rate)
     ax_bad.plot(x[valid], bad_rate[valid], color="#4B4B4B",
-                marker="o", lw=1.4, label="分期坏账率", zorder=3)
+                marker="o", lw=1.4, label="Period bad rate", zorder=3)
     if valid.any():
         ax_bad.errorbar(
             x[valid], bad_rate[valid],
@@ -1264,25 +1273,25 @@ def _plot_time_trend(axes, periods, matrices, info, period_context,
     if invalid.any():
         ax_bad.scatter(x[invalid], matrices["bad_rate"][invalid] * 100.0,
                        marker="x", s=28, color=_THRESHOLD_COLOR, zorder=4,
-                       label="单一标签期")
+                       label="Single-class period")
     ax_bad.axhline(info.get("_train_bad_rate", np.nan) * 100.0,
-                   color=_TRAIN_COLOR, ls=":", lw=1.0, label="训练整体")
+                   color=_TRAIN_COLOR, ls=":", lw=1.0, label="Train overall")
     if period_context["first_oot"] is not None:
         oot_mask = periods["split"].to_numpy() != "训练"
         if oot_mask.any():
             oot_bad = (matrices["bin_bad"].sum(axis=1)[oot_mask].sum()
                        / max(matrices["mapped_n"][oot_mask].sum(), 1))
             ax_bad.axhline(oot_bad * 100.0, color=_OOT_COLOR,
-                           ls=":", lw=1.0, label="OOT 整体")
-    ax_bad.set_ylabel("坏账率 (%)", fontsize=7.5)
+                           ls=":", lw=1.0, label="OOT overall")
+    ax_bad.set_ylabel("Bad rate (%)", fontsize=7.5)
     ax_bad.legend(fontsize=6.0, loc="upper right", ncol=3)
 
     period_iv = matrices["period_iv"]
     ax_iv.bar(x, np.where(np.isfinite(period_iv), period_iv, 0.0),
-              color="#6A51A3", alpha=0.78, label="分期 IV", zorder=2)
+              color="#6A51A3", alpha=0.78, label="Period IV", zorder=2)
     if np.isfinite(info.get("iv", np.nan)):
         ax_iv.axhline(info["iv"], color=_TRAIN_COLOR, ls="--", lw=1.0,
-                      label="训练整体 IV")
+                      label="Train overall IV")
     invalid_iv = ~np.isfinite(period_iv)
     if invalid_iv.any():
         ax_iv.scatter(x[invalid_iv], np.zeros(int(invalid_iv.sum())),
@@ -1291,51 +1300,10 @@ def _plot_time_trend(axes, periods, matrices, info, period_context,
     ax_iv.set_ylabel("IV", fontsize=7.5)
     ax_iv.legend(fontsize=6.0, loc="upper right", ncol=3)
 
-    period_psi = matrices["period_psi"]
-    low_period = matrices["low_period"]
-    reliable_psi = np.where(low_period, np.nan, period_psi)
-    ax_psi.plot(x, reliable_psi, color="#6A51A3", marker="o", lw=1.4,
-                label="PSI（可靠期间，相对训练）", zorder=3)
-    low_finite = low_period & np.isfinite(period_psi)
-    if low_finite.any():
-        ax_psi.scatter(x[low_finite], period_psi[low_finite], marker="^",
-                       s=34, facecolors="none", edgecolors=_THRESHOLD_COLOR,
-                       linewidths=1.0, zorder=5,
-                       label="低样本期 PSI（不参与判定）")
-    ax_psi.axhline(max_psi, color=_THRESHOLD_COLOR, ls="--", lw=1.0,
-                   label="筛选阈值 {:g}".format(max_psi))
-    if np.isfinite(reliable_psi).any():
-        index = int(np.nanargmax(reliable_psi))
-        ax_psi.scatter([x[index]], [reliable_psi[index]], s=38,
-                       facecolors="none", edgecolors=_THRESHOLD_COLOR,
-                       zorder=4, label="可靠期间最大 PSI")
-        upper = max(float(np.nanmax(reliable_psi)) * 1.35, max_psi * 1.2,
-                    1e-6)
-    else:
-        finite_all = period_psi[np.isfinite(period_psi)]
-        upper = (max(float(finite_all.max()) * 1.35, max_psi * 1.2, 1e-6)
-                 if len(finite_all) else 1.0)
-        ax_psi.text(0.5, 0.55,
-                    "无样本量达到作图阈值的期间\nPSI 仅作图参考",
-                    transform=ax_psi.transAxes, ha="center", va="center",
-                    fontsize=6.4, color=_THRESHOLD_COLOR)
-    for index in np.flatnonzero(low_finite):
-        value = period_psi[index]
-        if value > upper:
-            ax_psi.annotate("{:.3g}".format(value),
-                            xy=(x[index], upper * 0.96),
-                            xytext=(x[index], upper * 0.82), ha="center",
-                            fontsize=5.6, color=_THRESHOLD_COLOR,
-                            arrowprops=dict(arrowstyle="-|>",
-                                            color=_THRESHOLD_COLOR, lw=0.6))
-    ax_psi.set_ylabel("PSI", fontsize=7.5)
-    ax_psi.legend(fontsize=5.8, loc="upper right", ncol=2)
-    ax_psi.set_ylim(0, upper)
-
     positions = _period_tick_positions(n_periods, 14)
-    ax_psi.set_xticks(x[positions])
-    ax_psi.set_xticklabels([tick_labels[index] for index in positions],
-                           rotation=45, ha="right", fontsize=6.2)
+    ax_iv.set_xticks(x[positions])
+    ax_iv.set_xticklabels([tick_labels[index] for index in positions],
+                          rotation=45, ha="right", fontsize=6.2)
     for axis in axes[:-1]:
         axis.set_xticks([])
     for axis in axes:
@@ -1389,13 +1357,14 @@ def _plot_woe_heatmap(ax, ordered, matrices, periods, period_context,
                             ha="center", va="center", fontsize=5.6,
                             color="white" if abs(value) > 0.62 * limit
                             else "#222222", zorder=4)
-    ax.set_title("分期 WOE 热力图（固定训练分箱）", fontsize=9, loc="left")
-    ax.text(1.0, -0.19, "正=低风险（蓝）；负=高风险（红）；灰=空箱/期间单类；"
-            "斜线=低样本或零好/零坏", transform=ax.transAxes,
+    ax.set_title("Period WOE heatmap (fixed train bins)", fontsize=9, loc="left")
+    ax.text(1.0, -0.19, "Positive = lower risk (blue); negative = higher risk (red); "
+            "grey = empty/single-class; hatched = low sample or zero good/bad",
+            transform=ax.transAxes,
             ha="right", va="top", fontsize=6.0, color="#555555")
     ax.legend(handles=[Patch(facecolor="none", edgecolor="#444444",
                              hatch=_LOW_SAMPLE_HATCH,
-                             label="低样本/零好/零坏")],
+                             label="Low sample / zero good or bad")],
               fontsize=6.0, loc="upper right")
     colorbar = ax.figure.colorbar(image, ax=ax, fraction=0.025, pad=0.01)
     colorbar.set_label("WOE", fontsize=7)
@@ -1435,13 +1404,13 @@ def _plot_share_heatmap(ax, matrices, periods, period_context, short_labels,
                             ha="center", va="center", fontsize=5.6,
                             color="white" if value > 0.55 * upper
                             else "#222222", zorder=4)
-    ax.set_title("分期样本占比（分母=当期已映射样本）",
+    ax.set_title("Period sample share (denominator = mapped samples in period)",
                  fontsize=9, loc="left")
-    ax.text(1.0, -0.19, "灰=空箱；* = 跨越训练/OOT 切点的期间；"
-            "覆盖不足见下方原因与明细 CSV", transform=ax.transAxes,
+    ax.text(1.0, -0.19, "Grey = empty bin; * = period crossing train/OOT split; "
+            "coverage gaps: see reason and detail CSV", transform=ax.transAxes,
             ha="right", va="top", fontsize=6.0, color="#555555")
     colorbar = ax.figure.colorbar(image, ax=ax, fraction=0.025, pad=0.01)
-    colorbar.set_label("样本占比", fontsize=7)
+    colorbar.set_label("Sample share", fontsize=7)
     colorbar.ax.tick_params(labelsize=6)
 
 
@@ -1463,21 +1432,21 @@ def _plot_psi_panel(ax, ordered, matrices, periods, period_context,
     period_psi = matrices["period_psi"]
     reliable_psi = np.where(low_period, np.nan, period_psi)
     ax.plot(x, reliable_psi, color="#222222", marker="o", lw=1.4,
-            label="整体 PSI（可靠期间）", zorder=4)
+            label="Overall PSI (reliable periods)", zorder=4)
     low_finite = low_period & np.isfinite(period_psi)
     if low_finite.any():
         ax.scatter(x[low_finite], period_psi[low_finite], marker="^", s=42,
                    facecolors="none", edgecolors=_THRESHOLD_COLOR,
                    linewidths=1.2, zorder=6,
-                   label="低样本期 PSI（不参与判定）")
+                   label="Low-sample PSI (not used)")
     ax.axhline(max_psi, color=_THRESHOLD_COLOR, ls="--", lw=1.0,
-               label="筛选阈值 {:g}".format(max_psi), zorder=3)
+               label="Threshold {:g}".format(max_psi), zorder=3)
     if np.isfinite(reliable_psi).any():
         index = int(np.nanargmax(reliable_psi))
         ax.scatter([x[index]], [reliable_psi[index]], s=48,
                    facecolors="none", edgecolors="#222222", zorder=5)
         if n_periods <= 14:
-            ax.text(x[index], reliable_psi[index], " 可靠最大 {:.4f}".format(
+            ax.text(x[index], reliable_psi[index], " max reliable {:.4f}".format(
                 reliable_psi[index]), fontsize=6, va="bottom")
         upper = max(float(np.nanmax(reliable_psi)) * 1.35, max_psi * 1.2,
                     1e-6)
@@ -1486,7 +1455,7 @@ def _plot_psi_panel(ax, ordered, matrices, periods, period_context,
         upper = (max(float(finite_all.max()) * 1.35, max_psi * 1.2, 1e-6)
                  if len(finite_all) else 1.0)
         ax.text(0.5, 0.55,
-                "无样本量达到作图阈值的期间\nPSI 仅作图参考",
+                "No period reaches the min sample size\nPSI shown for reference only",
                 transform=ax.transAxes, ha="center", va="center",
                 fontsize=7.0, color=_THRESHOLD_COLOR)
     if n_periods <= 14:
@@ -1509,7 +1478,8 @@ def _plot_psi_panel(ax, ordered, matrices, periods, period_context,
     ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=6.2)
     _draw_period_overlay(ax, periods, period_context["first_oot"])
     ax.set_ylabel("PSI", fontsize=7.5)
-    ax.set_title("分期 PSI 与分箱贡献（相对训练分布；各箱贡献之和=整体 PSI）",
+    ax.set_title("Period PSI and bin contributions (vs train distribution; "
+                 "bin contributions sum to overall PSI)",
                  fontsize=9, loc="left")
     psi_contrib = matrices["psi_contrib"]
     reliable_contrib = np.where(low_period[:, None], np.nan, psi_contrib)
@@ -1518,10 +1488,11 @@ def _plot_psi_panel(ax, ordered, matrices, periods, period_context,
     if np.isfinite(source).any():
         flat_index = int(np.nanargmax(source))
         period_index, bin_index = divmod(flat_index, len(ordered))
-        prefix = ("可靠期间最大贡献" if np.isfinite(reliable_contrib).any()
-                  else "全期间最大贡献")
+        prefix = ("Max reliable contribution"
+                  if np.isfinite(reliable_contrib).any()
+                  else "Max contribution, all periods")
         ax.text(0.01, 0.98,
-                "{}：{} / {}（{:.4f}）".format(
+                "{}: {} / {} ({:.4f})".format(
                     prefix, periods.loc[period_index, "period_label"],
                     short_labels[bin_index], source[period_index, bin_index]),
                 transform=ax.transAxes, fontsize=6.2, color="#333333",
@@ -1551,7 +1522,7 @@ def _render_feature_figure_body(fig, analysis, info, params, plt, png_path,
     n_periods = len(periods)
 
     grid = fig.add_gridspec(
-        5, 6, height_ratios=[3.4, 2.8, 2.8, 2.0, 0.65],
+        5, 6, height_ratios=[3.4, 2.4, 2.8, 2.0, 0.65],
         hspace=0.48, wspace=0.34, left=0.055, right=0.97,
         top=0.905, bottom=0.02)
     overall_grid = grid[0, :].subgridspec(1, 3, wspace=0.34)
@@ -1561,16 +1532,16 @@ def _render_feature_figure_body(fig, analysis, info, params, plt, png_path,
     ax_table = fig.add_subplot(left_grid[1])
     ax_woe = fig.add_subplot(overall_grid[1])
     ax_iv = fig.add_subplot(overall_grid[2])
-    trend_grid = grid[1, :].subgridspec(4, 1, hspace=0.10)
-    trend_axes = [fig.add_subplot(trend_grid[index]) for index in range(4)]
+    trend_grid = grid[1, :].subgridspec(3, 1, hspace=0.10)
+    trend_axes = [fig.add_subplot(trend_grid[index]) for index in range(3)]
     ax_woe_heat = fig.add_subplot(grid[2, 0:3])
     ax_share_heat = fig.add_subplot(grid[2, 3:6])
     ax_psi = fig.add_subplot(grid[3, :])
     ax_reason = fig.add_subplot(grid[4, :])
 
-    title = "特征分析：{}".format(feature)
+    title = "Feature analysis: {}".format(feature)
     if export_name != feature:
-        title += "（导出名：{}）".format(export_name)
+        title += " (export name: {})".format(export_name)
     title_size = min(15.0, max(7.0, 15.0 * 90.0
                                / max(_text_display_width(title), 1.0)))
     fig.text(0.01, 0.988, title, fontsize=title_size, weight="bold",
@@ -1579,32 +1550,34 @@ def _render_feature_figure_body(fig, analysis, info, params, plt, png_path,
         analysis["train"]["sample_datetime"].min().strftime("%Y-%m-%d"),
         analysis["train"]["sample_datetime"].max().strftime("%Y-%m-%d"))
     if meta["oot_enabled"]:
-        oot_text = "{} ~ {}（n={:,}，坏账率 {:.2%}）".format(
+        oot_text = "{} ~ {} (n={:,}, bad rate {:.2%})".format(
             analysis["oot"]["sample_datetime"].min().strftime("%Y-%m-%d"),
             analysis["oot"]["sample_datetime"].max().strftime("%Y-%m-%d"),
             meta["oot_total"], meta["oot_bad_rate"])
     else:
-        oot_text = "未启用"
+        oot_text = "disabled"
     fig.text(0.01, 0.965,
-             "标签：{} | 训练：{}（n={:,}，坏账率 {:.2%}） | OOT：{}".format(
+             "Target: {} | Train: {} (n={:,}, bad rate {:.2%}) | OOT: {}".format(
                  params["target"], train_text, meta["train_total"],
                  meta["train_bad_rate"], oot_text),
              fontsize=9, ha="left", va="top")
     fig.text(0.01, 0.947,
-             "训练 IV={} | OOT IV={} | iv_min={} | PSI={} | 缺失率={} | "
-             "普通箱={} | 训练方向={}".format(
+             "Train IV={} | OOT IV={} | iv_min={} | PSI={} | Missing rate={} | "
+             "Ordinary bins={} | Train direction={}".format(
                  _fmt_float(reason["iv_train"]),
                  _fmt_float(reason["iv_oot"]),
                  _fmt_float(reason["iv_min"]),
                  _fmt_float(info.get("psi", np.nan)),
                  _fmt_pct(info.get("missing_rate", np.nan)),
-                 reason["n_normal_bins"], reason["train_direction"]),
+                 reason["n_normal_bins"],
+                 _direction_en(reason["train_direction"])),
              fontsize=9, ha="left", va="top")
     fig.text(0.01, 0.929,
-             ("注：OOT 参与分箱方案选择，不是独立验证集；OOT 未覆盖样本={}。"
+             ("Note: OOT is used for bin selection, not an independent validation "
+              "set; OOT uncovered samples={}."
               .format(int(round(meta["oot_uncovered"])))
               if meta["oot_enabled"] else
-              "注：未启用 OOT，OOT 相关指标为 NA。"),
+              "Note: OOT disabled; OOT metrics are NA."),
              fontsize=7.8, color="#555555", ha="left", va="top")
 
     _plot_share_panel(ax_share, ax_table, ordered, meta, info,
@@ -1626,8 +1599,8 @@ def _render_feature_figure_body(fig, analysis, info, params, plt, png_path,
     trend_info = dict(info)
     trend_info["_train_bad_rate"] = meta["train_bad_rate"]
     _plot_time_trend(trend_axes, periods, matrices, trend_info,
-                     period_context, params["max_psi"],
-                     params["plot_min_period_n"], tick_labels)
+                     period_context, params["plot_min_period_n"],
+                     tick_labels)
     _plot_woe_heatmap(ax_woe_heat, ordered, matrices, periods,
                       period_context, short_labels,
                       params["plot_min_bin_n"], plt)
@@ -1661,7 +1634,6 @@ def _render_feature_figure(analysis, info, params, plt, png_path,
 _INDEX_COLUMNS = [
     "original_feature", "export_name", "plot_png", "plot_pdf",
     "plot_status", "plot_error", "candidate_reason",
-    "iv_train", "iv_oot", "iv_min", "psi", "missing_rate",
     "name_collision", "collision_group",
 ]
 _TIME_COLUMNS = [
@@ -1812,11 +1784,6 @@ def generate_feature_analysis_plots(data, train, oot, target, summary,
             if reason is None:
                 reason = {
                     "candidate_reason": "分析失败：{}".format(error),
-                    "iv_train": info.get("iv", np.nan),
-                    "iv_oot": info.get("oot_iv", np.nan),
-                    "iv_min": info.get("iv_min", np.nan),
-                    "psi": info.get("psi", np.nan),
-                    "missing_rate": info.get("missing_rate", np.nan),
                 }
         index_rows.append({
             "original_feature": feature,
@@ -1826,11 +1793,6 @@ def generate_feature_analysis_plots(data, train, oot, target, summary,
             "plot_status": status,
             "plot_error": error,
             "candidate_reason": reason["candidate_reason"],
-            "iv_train": reason.get("iv_train", np.nan),
-            "iv_oot": reason.get("iv_oot", np.nan),
-            "iv_min": reason.get("iv_min", np.nan),
-            "psi": reason.get("psi", np.nan),
-            "missing_rate": reason.get("missing_rate", np.nan),
             "name_collision": export_name in collision_groups,
             "collision_group": (export_name
                                 if export_name in collision_groups else ""),
