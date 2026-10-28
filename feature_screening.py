@@ -16,8 +16,8 @@ OOT 稳定且缺失贡献不超限筛选；入选后再按 WOE 相关性贪心�
 
 筛选完成后可对最终候选特征批量生成分析图（默认开启）：整体分箱占比/
 坏账率/WOE/IV 贡献、OOT 对照、分期趋势、WOE 热力图、分期占比与 PSI
-来源、自动诊断。绘图与诊断只读取现有结果，不修改 selected、reason、
-候选清单或分箱边界。绘图依赖 matplotlib（pip install matplotlib）。
+来源，并在图底部标注纳入候选的原因。绘图只读取现有结果，不修改
+selected、reason、候选清单或分箱边界。绘图依赖 matplotlib。
 """
 from pathlib import Path
 from datetime import datetime
@@ -42,8 +42,7 @@ DEFAULT_ROOT_DIR = (
 )
 
 # 最近一次绘图运行的产出，便于 notebook 直接读取。
-# 结构：{"run_dir": Path, "index": DataFrame, "diagnostics": DataFrame,
-#        "time_detail": DataFrame}
+# 结构：{"run_dir": Path, "index": DataFrame, "time_detail": DataFrame}
 LAST_ANALYSIS = None
 
 _TRAIN_COLOR = "#2C7FB8"
@@ -786,181 +785,46 @@ def _overall_table(detail, info, train, oot, target):
     return table, meta
 
 
-def _adverse_steps(rates, ns, bads, goods, direction, tol,
-                   min_bin_n, min_bin_good, min_bin_bad,
-                   jump_threshold, z=1.96):
-    """按训练方向找出反向跳点；区分可靠反转与证据不足。"""
-    rates = np.asarray(rates, dtype=float)
-    ns = np.asarray(ns, dtype=float)
-    bads = np.asarray(bads, dtype=float)
-    goods = np.asarray(goods, dtype=float)
-    if direction not in ("递增", "递减") or len(rates) < 2:
-        return []
-    low, high = _wilson_interval(bads, ns)
-    steps = []
-    for index in range(len(rates) - 1):
-        if not (np.isfinite(rates[index]) and np.isfinite(rates[index + 1])):
-            continue
-        change = rates[index + 1] - rates[index]
-        adverse = (change < -tol) if direction == "递增" else (change > tol)
-        if not adverse:
-            continue
-        reliable = bool(
-            ns[index] >= min_bin_n and ns[index + 1] >= min_bin_n
-            and bads[index] >= min_bin_bad and bads[index + 1] >= min_bin_bad
-            and goods[index] >= min_bin_good
-            and goods[index + 1] >= min_bin_good)
-        separated = bool(
-            np.isfinite(low[index]) and np.isfinite(high[index + 1])
-            and (low[index] > high[index + 1]
-                 or low[index + 1] > high[index]))
-        magnitude = abs(change)
-        steps.append({
-            "index": index, "magnitude": magnitude,
-            "rate_left": rates[index], "rate_right": rates[index + 1],
-            "n_left": ns[index], "n_right": ns[index + 1],
-            "bad_left": bads[index], "bad_right": bads[index + 1],
-            "reliable": reliable, "ci_separated": separated,
-            "clear": bool(reliable and separated and magnitude >= tol),
-            "jump": bool(reliable and separated
-                         and magnitude >= jump_threshold),
-        })
-    return steps
-
-
 def _prepare_feature_analysis(feature, export_name, detail, info, data,
                               target, train, oot, period_context, params):
-    """计算单个特征的整体/分期统计和诊断，不修改任何筛选字段。"""
+    """计算单个特征的整体/分期统计和候选原因，不修改任何筛选字段。"""
     overall, overall_meta = _overall_table(detail, info, train, oot, target)
     matrices, time_long = _time_bin_matrices(
         data[feature].to_numpy(dtype=float),
         data[target].to_numpy(dtype=float),
         detail, period_context,
-        params["diag_min_bin_n"], params["diag_min_bin_good"],
-        params["diag_min_bin_bad"], params["diag_min_period_n"])
-    diagnostics = _diagnose_feature(
-        feature, export_name, overall, overall_meta, info, matrices,
-        period_context, train, oot, target, params)
+        params["plot_min_bin_n"], params["plot_min_bin_good"],
+        params["plot_min_bin_bad"], params["plot_min_period_n"])
+    reason = _build_candidate_reason(
+        overall, overall_meta, info, period_context, params)
     return {
         "feature": feature, "export_name": export_name,
         "overall": overall, "overall_meta": overall_meta,
         "matrices": matrices, "time_long": time_long,
-        "diagnostics": diagnostics, "period_context": period_context,
+        "reason": reason, "period_context": period_context,
         "train": train, "oot": oot,
     }
 
 
-def _diagnose_feature(feature, export_name, overall, overall_meta, info,
-                      matrices, period_context, train, oot, target, params):
-    """生成结构化诊断和保留/观察/建议复查结论。"""
-    severe, warn, notes = [], [], []
+def _build_candidate_reason(overall, overall_meta, info, period_context,
+                            params):
+    """汇总该特征通过筛选的依据，不改动任何筛选结果。"""
     oot_enabled = overall_meta["oot_enabled"]
     iv_train = float(info.get("iv", np.nan))
     iv_oot = float(info.get("oot_iv", np.nan)) if oot_enabled else np.nan
     iv_min = float(info.get("iv_min", np.nan))
-    iv_floor = params["diag_iv_floor"]
-    min_bin_n = params["diag_min_bin_n"]
-    min_bin_good = params["diag_min_bin_good"]
-    min_bin_bad = params["diag_min_bin_bad"]
-    max_missing_share = params["max_missing_iv_share"]
-    max_psi = params["max_psi"]
+    iv_floor = params["plot_iv_floor"]
     train_dir = str(info.get("monotonic_direction", "NA"))
+    n_normal_bins = int(info.get("n_normal_bins", 0))
+    missing_share = float(info.get("iv_missing_share", np.nan))
     train_n = int(overall_meta["train_total"])
     oot_total = int(overall_meta["oot_total"])
-    n_counts = overall["n"].to_numpy(dtype=float)
-    n_bads = overall["bad"].to_numpy(dtype=float)
-    n_goods = n_counts - n_bads
-    iv_parts = overall["iv_part"].to_numpy(dtype=float)
-    missing_share = float(info.get("iv_missing_share", np.nan))
-    max_bin = None
-    max_share = np.nan
-    if np.isfinite(iv_train) and iv_train > iv_floor:
-        max_index = int(np.nanargmax(iv_parts))
-        max_bin = overall.iloc[max_index]
-        max_share = float(iv_parts[max_index] / iv_train)
-    max_bin_small = bool(max_bin is not None
-                         and float(max_bin["n"]) < min_bin_n)
-    shares = (iv_parts / iv_train) if (np.isfinite(iv_train)
-                                       and iv_train > iv_floor) else np.full(
-        len(iv_parts), np.nan)
-    small_mask = (n_counts > 0) & (n_counts < min_bin_n) & np.isfinite(shares) \
-        & (shares >= params["diag_small_bin_iv_share"])
-    small_concentrated = bool(np.any(small_mask))
-
-    n_low_bins = int(np.sum((n_counts > 0) & (n_counts < min_bin_n)))
-    n_zero_good_bins = int(np.sum((n_counts > 0) & (n_goods <= 0)))
-    n_zero_bad_bins = int(np.sum((n_counts > 0) & (n_bads <= 0)))
-    n_normal_bins = int((~overall["is_missing"]).sum())
-
-    train_mapped = float(n_counts.sum())
+    train_mapped = float(overall["n"].sum())
     oot_mapped = float(overall_meta["oot_mapped"])
     coverage_all = ((train_mapped + oot_mapped)
                     / float(train_n + oot_total)) if (train_n + oot_total) else np.nan
     coverage_oot = (oot_mapped / oot_total) if oot_total else np.nan
     uncovered_oot = float(overall_meta["oot_uncovered"])
-    period_coverages = matrices["coverage"]
-    min_period_coverage = (
-        float(np.nanmin(period_coverages))
-        if np.isfinite(period_coverages).any() else np.nan)
-    uncovered_total = float(np.nansum(matrices["uncovered_n"]))
-
-    periods = period_context["periods"]
-    n_periods = period_context["n_periods"]
-    n_low_periods = int((periods["n_total"] < params["diag_min_period_n"]).sum())
-    n_invalid_periods = int(
-        ((periods["n_total"] > 0) & (~periods["both_classes"])).sum())
-    n_cross_periods = int((periods["split"] == "跨界").sum())
-    valid_period_mask = matrices["mapped_n"] > 0
-    n_empty_cells = int(np.sum((matrices["bin_n"] == 0)
-                               & valid_period_mask[:, None]))
-    n_low_cells = int(np.sum(matrices["low_n"]))
-    n_zero_good_cells = int(np.sum(matrices["zero_good"]))
-    n_zero_bad_cells = int(np.sum(matrices["zero_bad"]))
-
-    period_psi = matrices["period_psi"]
-    period_n = periods["n_total"].to_numpy(dtype=float)
-    reliable_period = period_n >= params["diag_min_period_n"]
-    max_period_psi = (float(np.nanmax(period_psi))
-                      if np.isfinite(period_psi).any() else np.nan)
-    max_period_psi_label = "NA"
-    if np.isfinite(max_period_psi):
-        max_period_psi_label = str(
-            periods.loc[int(np.nanargmax(period_psi)), "period_label"])
-    reliable_psi = np.where(reliable_period, period_psi, np.nan)
-    max_reliable_period_psi = (float(np.nanmax(reliable_psi))
-                               if np.isfinite(reliable_psi).any() else np.nan)
-    max_reliable_period_psi_label = "NA"
-    if np.isfinite(max_reliable_period_psi):
-        max_reliable_period_psi_label = str(
-            periods.loc[int(np.nanargmax(reliable_psi)), "period_label"])
-    psi_contrib = matrices["psi_contrib"]
-    max_psi_contrib_value = np.nan
-    max_psi_contrib_bin = "NA"
-    if np.isfinite(psi_contrib).any():
-        flat_index = int(np.nanargmax(psi_contrib))
-        period_index, bin_index = divmod(flat_index, len(overall))
-        max_psi_contrib_value = float(psi_contrib[period_index, bin_index])
-        max_psi_contrib_bin = "{} / {}".format(
-            periods.loc[period_index, "period_label"],
-            overall.iloc[bin_index]["bin_label"])
-    reliable_contrib = np.where(reliable_period[:, None], psi_contrib, np.nan)
-    max_reliable_psi_contrib_value = np.nan
-    max_reliable_psi_contrib_bin = "NA"
-    if np.isfinite(reliable_contrib).any():
-        flat_index = int(np.nanargmax(reliable_contrib))
-        period_index, bin_index = divmod(flat_index, len(overall))
-        max_reliable_psi_contrib_value = float(
-            reliable_contrib[period_index, bin_index])
-        max_reliable_psi_contrib_bin = "{} / {}".format(
-            periods.loc[period_index, "period_label"],
-            overall.iloc[bin_index]["bin_label"])
-    psi_sum_diff = np.nan
-    for index in range(n_periods):
-        if np.isfinite(period_psi[index]):
-            total = np.nansum(psi_contrib[index])
-            diff = abs(total - period_psi[index])
-            if not np.isfinite(psi_sum_diff) or diff > psi_sum_diff:
-                psi_sum_diff = diff
 
     oot_dir = "NA"
     direction_consistent = None
@@ -972,295 +836,59 @@ def _diagnose_feature(feature, export_name, overall, overall_meta, info,
         if train_dir in ("递增", "递减") and oot_dir in ("递增", "递减"):
             direction_consistent = (train_dir == oot_dir)
 
-    ordered_detail = matrices["ordered_detail"]
-    ordinary_mask = ~ordered_detail["is_missing"].to_numpy(dtype=bool)
-    period_steps = []
-    for index in range(n_periods):
-        if not matrices["period_valid"][index]:
-            continue
-        rates = np.full(len(overall), np.nan)
-        occupied = matrices["bin_n"][index] > 0
-        rates[occupied] = (matrices["bin_bad"][index, occupied]
-                           / matrices["bin_n"][index, occupied])
-        steps = _adverse_steps(
-            rates[ordinary_mask], matrices["bin_n"][index, ordinary_mask],
-            matrices["bin_bad"][index, ordinary_mask],
-            matrices["bin_good"][index, ordinary_mask], train_dir,
-            params["diag_direction_tol"], min_bin_n, min_bin_good,
-            min_bin_bad, params["diag_jump_bad_rate"])
-        for step in steps:
-            step["period"] = str(periods.loc[index, "period_label"])
-            step["bin_left"] = str(
-                overall.iloc[np.flatnonzero(ordinary_mask)[step["index"]]][
-                    "bin_label"])
-            step["bin_right"] = str(
-                overall.iloc[np.flatnonzero(ordinary_mask)[step["index"] + 1]][
-                    "bin_label"])
-        period_steps.extend(steps)
-    reversal_periods = sorted(set(step["period"] for step in period_steps))
-    clear_steps = [step for step in period_steps if step["clear"]]
-    jump_steps = [step for step in period_steps if step["jump"]]
-    oot_steps = []
+    parts = []
+    if train_dir in ("递增", "递减"):
+        if oot_enabled and info.get("oot_is_monotonic"):
+            parts.append("训练/OOT 均单调{}".format(train_dir))
+        else:
+            parts.append("训练单调{}".format(train_dir))
+    elif train_dir == "持平":
+        parts.append("普通箱坏账率持平")
+    elif train_dir == "单普通箱，免检":
+        parts.append("仅 1 个普通箱，无单调方向")
+    else:
+        parts.append("训练方向={}".format(train_dir))
     if oot_enabled:
-        ordinary = overall.loc[~overall["is_missing"]]
-        oot_ns = ordinary["oot_n"].to_numpy(dtype=float)
-        oot_bads = ordinary["oot_bad"].to_numpy(dtype=float)
-        oot_steps = _adverse_steps(
-            ordinary["oot_bad_rate"].to_numpy(dtype=float), oot_ns, oot_bads,
-            oot_ns - oot_bads, train_dir, params["diag_direction_tol"],
-            min_bin_n, min_bin_good, min_bin_bad,
-            params["diag_jump_bad_rate"])
-    oot_clear = [step for step in oot_steps if step["clear"]]
-    oot_jumps = [step for step in oot_steps if step["jump"]]
-
-    if oot_enabled:
-        notes.append("OOT 已参与分箱方案选择，不是独立验证集")
+        parts.append("训练 IV={}、OOT IV={}，iv_min={} ≥ {}".format(
+            _fmt_float(iv_train), _fmt_float(iv_oot), _fmt_float(iv_min),
+            _fmt_float(params["min_iv"])))
+        parts.append("OOT PSI={} ≤ {}".format(
+            _fmt_float(info.get("psi", np.nan)),
+            _fmt_float(params["max_psi"])))
     else:
-        warn.append("未启用 OOT，缺少时间外验证")
-    notes.append("训练集单调性由分箱算法约束，不作为额外验证证据")
-    notes.append("时间分析固定使用训练期分箱边界，未重新拟合")
-    notes.append("诊断阈值仅用于报告提示，不改变筛选结果")
-
-    if direction_consistent is False:
-        severe.append("OOT 风险方向与训练相反（训练{}，OOT{}）".format(
-            train_dir, oot_dir))
-    if oot_enabled and np.isfinite(iv_oot) and iv_train > iv_floor:
-        drop = (iv_train - iv_oot) / iv_train
-        if drop > 0.5:
-            severe.append("OOT IV 较训练下降 {:.1%}（{:.4f}→{:.4f}）".format(
-                drop, iv_train, iv_oot))
-        elif drop > 0.25:
-            warn.append("OOT IV 较训练下降 {:.1%}（{:.4f}→{:.4f}）".format(
-                drop, iv_train, iv_oot))
-    if np.isfinite(coverage_all) and coverage_all < params["diag_review_coverage"]:
-        severe.append(
-            "数据覆盖率 {:.1%} 低于复查阈值 {:.0%}（未覆盖 {} 条，"
-            "其中 OOT 未覆盖 {} 条）".format(
-                coverage_all, params["diag_review_coverage"],
-                int(round(uncovered_total)), int(round(uncovered_oot))))
-    elif np.isfinite(coverage_all) and coverage_all < params["diag_min_coverage"]:
-        warn.append("数据覆盖率 {:.1%} 低于提示阈值 {:.0%}".format(
-            coverage_all, params["diag_min_coverage"]))
-    if uncovered_oot > 0:
-        warn.append(
-            "OOT 有 {} 条缺失值未被训练分箱覆盖（OOT 覆盖率 {:.1%}），"
-            "已排除出 OOT IV/PSI".format(
-                int(round(uncovered_oot)), coverage_oot))
-    if max_missing_share is not None and np.isfinite(missing_share) \
-            and missing_share > max_missing_share + TOL:
-        severe.append("缺失箱 IV 占比 {:.1%} 超过筛选阈值 {:.0%}".format(
-            missing_share, max_missing_share))
-    elif np.isfinite(missing_share) and missing_share >= 0.3:
-        warn.append("缺失箱 IV 占比 {:.1%}，风险区分较依赖缺失".format(
-            missing_share))
-    if iv_train <= iv_floor:
-        warn.append("训练 IV={:.4f} 接近 0，IV 贡献比例不稳定".format(iv_train))
-    if n_normal_bins <= 1:
-        warn.append("仅 {} 个普通箱，无法判断数值型风险趋势".format(
-            n_normal_bins))
-    if n_low_bins:
-        warn.append("训练期有 {} 个箱样本量低于诊断阈值 {}".format(
-            n_low_bins, min_bin_n))
-    if n_zero_good_bins or n_zero_bad_bins:
-        warn.append(
-            "训练期有 {} 个箱无好样本、{} 个箱无坏样本；"
-            "平滑后 WOE 可计算但证据不足".format(
-                n_zero_good_bins, n_zero_bad_bins))
-    if max_bin is not None and np.isfinite(max_share):
-        if max_bin_small and max_share >= params["diag_max_bin_iv_share"]:
-            severe.append(
-                "最大 IV 贡献来自小样本箱 {}（n={}，占训练 {:.2%}，"
-                "贡献 {:.1%}）".format(
-                    max_bin["bin_label"], int(max_bin["n"]),
-                    float(max_bin["n"]) / max(train_n, 1), max_share))
-        elif max_share >= params["diag_max_bin_iv_share"]:
-            warn.append(
-                "最大单箱 IV 贡献 {:.1%} 集中在 {}（n={}，占训练 {:.2%}）".format(
-                    max_share, max_bin["bin_label"], int(max_bin["n"]),
-                    float(max_bin["n"]) / max(train_n, 1)))
-    if small_concentrated and not (
-            max_bin is not None and max_bin_small
-            and np.isfinite(max_share)
-            and max_share >= params["diag_max_bin_iv_share"]):
-        warn.append("存在小样本箱贡献集中（箱样本 < {} 且 IV 贡献 ≥ {:.0%}）".format(
-            min_bin_n, params["diag_small_bin_iv_share"]))
-    if n_periods <= 1:
-        warn.append("仅 {} 个时间段，无法评估时间稳定性".format(n_periods))
-    if n_invalid_periods:
-        labels = periods.loc[
-            (periods["n_total"] > 0) & (~periods["both_classes"]),
-            "period_label"].tolist()
-        warn.append("{} 个期间只有单一标签（{}），WOE/IV 记 NA".format(
-            n_invalid_periods, "、".join(labels[:3])
-            + ("等" if len(labels) > 3 else "")))
-    if n_low_periods:
-        min_n = int(periods["n_total"].min())
-        warn.append("{} 个期间样本量低于诊断阈值 {}（最小 {}）".format(
-            n_low_periods, params["diag_min_period_n"], min_n))
-    if clear_steps:
-        worst = max(clear_steps, key=lambda item: item["magnitude"])
-        severe.append(
-            "期间出现明显方向反转 {} 次，最大一次在 {}（{}→{}，"
-            "坏账率 {:.2%}→{:.2%}，n={}/{}）".format(
-                len(clear_steps), worst["period"], worst["bin_left"],
-                worst["bin_right"], worst["rate_left"], worst["rate_right"],
-                int(worst["n_left"]), int(worst["n_right"])))
-    elif period_steps:
-        worst = max(period_steps, key=lambda item: item["magnitude"])
-        warn.append(
-            "期间存在 {} 次局部方向波动（未达明显反转标准），最大在 {}"
-            "（{:.2%}→{:.2%}，n={}/{}）".format(
-                len(period_steps), worst["period"], worst["rate_left"],
-                worst["rate_right"], int(worst["n_left"]),
-                int(worst["n_right"])))
-    if jump_steps:
-        worst = max(jump_steps, key=lambda item: item["magnitude"])
-        warn.append(
-            "期间有 {} 个可靠异常跳点，最大在 {}（{}→{}，变化 {:.2%}）".format(
-                len(jump_steps), worst["period"], worst["bin_left"],
-                worst["bin_right"], worst["magnitude"]))
-    if oot_clear:
-        worst = max(oot_clear, key=lambda item: item["magnitude"])
-        severe.append(
-            "OOT 整体出现明显方向反转（B{}→B{}，坏账率 {:.2%}→{:.2%}，"
-            "n={}/{}）".format(
-                worst["index"] + 1, worst["index"] + 2, worst["rate_left"],
-                worst["rate_right"], int(worst["n_left"]),
-                int(worst["n_right"])))
-    elif oot_jumps:
-        warn.append("OOT 整体存在 {} 个可靠异常跳点".format(len(oot_jumps)))
-    if np.isfinite(max_reliable_period_psi):
-        if max_reliable_period_psi > params["diag_psi_review"]:
-            severe.append(
-                "可靠期间 PSI 最大 {:.4f}（{}，n≥{}）超过复查阈值 {:.4f}".format(
-                    max_reliable_period_psi, max_reliable_period_psi_label,
-                    params["diag_min_period_n"], params["diag_psi_review"]))
-        elif max_reliable_period_psi > max_psi:
-            warn.append(
-                "可靠期间 PSI 最大 {:.4f}（{}，n≥{}）超过筛选阈值 {:.4f}".format(
-                    max_reliable_period_psi, max_reliable_period_psi_label,
-                    params["diag_min_period_n"], max_psi))
+        parts.append("训练 IV={} ≥ {}".format(
+            _fmt_float(iv_train), _fmt_float(params["min_iv"])))
+        parts.append("未启用 OOT")
+    if params["max_missing_iv_share"] is None:
+        parts.append("缺失箱 IV 占比={}".format(_fmt_pct(missing_share)))
     else:
-        warn.append(
-            "没有样本量达到 {} 的期间，期间 PSI 不参与稳定性判定".format(
-                params["diag_min_period_n"]))
-    if np.isfinite(max_period_psi) and (
-            not np.isfinite(max_reliable_period_psi)
-            or max_period_psi > max_reliable_period_psi + TOL):
-        raw_index = int(np.nanargmax(period_psi))
-        warn.append(
-            "全期间 PSI 最大 {:.4f}（{}，n={}）来自低样本期间，"
-            "不参与严重判定".format(
-                max_period_psi, max_period_psi_label,
-                int(period_n[raw_index])))
-    if n_empty_cells:
-        notes.append("分期空箱 {} 个，对应 WOE/占比显示为 NA".format(n_empty_cells))
-    if n_low_cells or n_zero_good_cells or n_zero_bad_cells:
-        notes.append(
-            "分期低样本箱 {} 个、零好样本箱 {} 个、零坏样本箱 {} 个；"
-            "热力图中用斜线标记".format(
-                n_low_cells, n_zero_good_cells, n_zero_bad_cells))
-    if period_context["gaps"]:
-        gap = max(period_context["gaps"], key=lambda item: item["gap"])
-        notes.append("时间存在 {} 个间隔，最大间隔 {} {}{}".format(
-            len(period_context["gaps"]), gap["gap"], gap["unit"],
-            "（{} → {}）".format(gap["previous"], gap["next"])))
-    if n_cross_periods:
-        notes.append("{} 个期间跨越训练/OOT 切点，按跨界期间标注".format(
-            n_cross_periods))
-    if info.get("is_stable") is False:
-        severe.append("分箱方案在 OOT 评估中不稳定（已由筛选层标记）")
-
-    if severe:
-        conclusion = "建议复查"
-    elif warn:
-        conclusion = "观察"
+        parts.append("缺失箱 IV 占比={} ≤ {:.0%}".format(
+            _fmt_pct(missing_share), params["max_missing_iv_share"]))
+    if params.get("dedup_corr") is not None:
+        parts.append("已通过 WOE 相关性去重（阈值 {:g}）".format(
+            params["dedup_corr"]))
     else:
-        conclusion = "保留"
+        parts.append("未启用相关性去重")
+    candidate_reason = "纳入候选原因：" + "；".join(parts) + "。"
 
-    if max_bin is not None and np.isfinite(max_share):
-        max_bin_text = "{}（n={}，占训练 {:.2%}，IV 贡献 {:.1%}）".format(
-            max_bin["bin_label"], int(max_bin["n"]),
-            float(max_bin["n"]) / max(train_n, 1), max_share)
-    else:
-        max_bin_text = "NA（IV≈0）"
-    base_evidence = (
-        "训练 IV={}；OOT IV={}；iv_min={}；最大单箱贡献 {}；"
-        "缺失箱 IV 占比 {}；可靠期间 PSI 最大 {}（{}）；"
-        "方向训练{} / OOT{}；覆盖率 {}；期间数 {}").format(
-            _fmt_float(iv_train), _fmt_float(iv_oot),
-            _fmt_float(iv_min), max_bin_text,
-            _fmt_pct(missing_share), _fmt_float(max_reliable_period_psi),
-            max_reliable_period_psi_label, train_dir, oot_dir,
-            _fmt_pct(coverage_all), n_periods)
-    evidence_parts = [base_evidence] + severe + warn
-    evidence = "；".join(evidence_parts)
-    if len(evidence) > 1600:
-        evidence = evidence[:1597] + "..."
-    warnings_text = "；".join(warn)
-    severe_text = "；".join(severe)
-    limitations = "；".join(notes)
-    thresholds = (
-        "箱n≥{}；好样本≥{}；坏样本≥{}；期间n≥{}；覆盖率提示≥{:.0%}；"
-        "覆盖率复查≥{:.0%}；单箱贡献提示≥{:.0%}；小样本贡献≥{:.0%}；"
-        "方向容差{:.1%}；跳点{:.1%}；期间PSI仅统计n≥{}的期间；"
-        "期间PSI复查>{:.4f}").format(
-            min_bin_n, min_bin_good, min_bin_bad,
-            params["diag_min_period_n"], params["diag_min_coverage"],
-            params["diag_review_coverage"], params["diag_max_bin_iv_share"],
-            params["diag_small_bin_iv_share"], params["diag_direction_tol"],
-            params["diag_jump_bad_rate"], params["diag_min_period_n"],
-            params["diag_psi_review"])
     iv_change_pct = (
         (iv_oot / iv_train - 1.0) * 100.0
         if (np.isfinite(iv_oot) and np.isfinite(iv_train)
             and iv_train > iv_floor) else np.nan)
     return {
-        "conclusion": conclusion, "evidence": evidence,
-        "severe_issues": severe_text, "warnings": warnings_text,
-        "limitations": limitations, "thresholds": thresholds,
+        "candidate_reason": candidate_reason,
         "iv_train": iv_train, "iv_oot": iv_oot, "iv_min": iv_min,
         "iv_change_pct": iv_change_pct,
         "iv_missing": info.get("iv_missing", np.nan),
         "iv_missing_share": missing_share,
         "n_normal_bins": n_normal_bins,
-        "max_iv_bin": max_bin["bin_label"] if max_bin is not None else "NA",
-        "max_iv_bin_n": int(max_bin["n"]) if max_bin is not None else 0,
-        "max_iv_share": max_share,
-        "max_iv_bin_small": max_bin_small,
-        "small_bin_concentrated": small_concentrated,
-        "n_low_bins": n_low_bins,
-        "n_zero_good_bins": n_zero_good_bins,
-        "n_zero_bad_bins": n_zero_bad_bins,
         "train_direction": train_dir, "oot_direction": oot_dir,
         "direction_consistent": direction_consistent,
-        "n_periods": n_periods, "n_cross_periods": n_cross_periods,
-        "n_low_periods": n_low_periods,
-        "n_invalid_periods": n_invalid_periods,
-        "n_empty_cells": n_empty_cells,
-        "n_low_cells": n_low_cells,
-        "n_zero_good_cells": n_zero_good_cells,
-        "n_zero_bad_cells": n_zero_bad_cells,
-        "n_reversal_periods": len(reversal_periods),
-        "n_clear_reversal_periods": len(set(
-            step["period"] for step in clear_steps)),
-        "n_jump_steps": len(jump_steps),
-        "max_period_psi": max_period_psi,
-        "max_period_psi_label": max_period_psi_label,
-        "max_reliable_period_psi": max_reliable_period_psi,
-        "max_reliable_period_psi_label": max_reliable_period_psi_label,
-        "max_psi_contrib_bin": max_psi_contrib_bin,
-        "max_psi_contrib_value": max_psi_contrib_value,
-        "max_reliable_psi_contrib_bin": max_reliable_psi_contrib_bin,
-        "max_reliable_psi_contrib_value": max_reliable_psi_contrib_value,
-        "psi_sum_max_diff": psi_sum_diff,
+        "psi": float(info.get("psi", np.nan)),
+        "missing_rate": float(info.get("missing_rate", np.nan)),
+        "n_periods": period_context["n_periods"],
         "coverage_all": coverage_all, "coverage_oot": coverage_oot,
-        "min_period_coverage": min_period_coverage,
-        "uncovered_total": uncovered_total,
         "uncovered_oot": uncovered_oot,
-        "date_gap_count": len(period_context["gaps"]),
-        "oot_iv_recomputed": overall_meta["oot_iv_recomputed"],
-        "oot_iv_check": overall_meta["oot_iv_check"],
         "time_freq": period_context["freq"],
     }
 
@@ -1685,7 +1313,7 @@ def _plot_time_trend(axes, periods, matrices, info, period_context,
         upper = (max(float(finite_all.max()) * 1.35, max_psi * 1.2, 1e-6)
                  if len(finite_all) else 1.0)
         ax_psi.text(0.5, 0.55,
-                    "无样本量达到诊断阈值的期间\nPSI 仅作图参考，不参与判定",
+                    "无样本量达到作图阈值的期间\nPSI 仅作图参考",
                     transform=ax_psi.transAxes, ha="center", va="center",
                     fontsize=6.4, color=_THRESHOLD_COLOR)
     for index in np.flatnonzero(low_finite):
@@ -1807,7 +1435,7 @@ def _plot_share_heatmap(ax, matrices, periods, period_context, short_labels,
     ax.set_title("分期样本占比（分母=当期已映射样本）",
                  fontsize=9, loc="left")
     ax.text(1.0, -0.19, "灰=空箱；* = 跨越训练/OOT 切点的期间；"
-            "覆盖不足见下方诊断与明细 CSV", transform=ax.transAxes,
+            "覆盖不足见下方原因与明细 CSV", transform=ax.transAxes,
             ha="right", va="top", fontsize=6.0, color="#555555")
     colorbar = ax.figure.colorbar(image, ax=ax, fraction=0.025, pad=0.01)
     colorbar.set_label("样本占比", fontsize=7)
@@ -1855,7 +1483,7 @@ def _plot_psi_panel(ax, ordered, matrices, periods, period_context,
         upper = (max(float(finite_all.max()) * 1.35, max_psi * 1.2, 1e-6)
                  if len(finite_all) else 1.0)
         ax.text(0.5, 0.55,
-                "无样本量达到诊断阈值的期间\nPSI 仅作图参考，不参与判定",
+                "无样本量达到作图阈值的期间\nPSI 仅作图参考",
                 transform=ax.transAxes, ha="center", va="center",
                 fontsize=7.0, color=_THRESHOLD_COLOR)
     if n_periods <= 14:
@@ -1908,7 +1536,7 @@ def _render_feature_figure_body(fig, analysis, info, params, plt, png_path,
     meta = analysis["overall_meta"]
     matrices = analysis["matrices"]
     period_context = analysis["period_context"]
-    diagnostics = analysis["diagnostics"]
+    reason = analysis["reason"]
     periods = period_context["periods"]
     feature = analysis["feature"]
     export_name = analysis["export_name"]
@@ -1920,9 +1548,9 @@ def _render_feature_figure_body(fig, analysis, info, params, plt, png_path,
     n_periods = len(periods)
 
     grid = fig.add_gridspec(
-        5, 6, height_ratios=[3.4, 2.8, 2.8, 2.0, 1.15],
+        5, 6, height_ratios=[3.4, 2.8, 2.8, 2.0, 0.65],
         hspace=0.48, wspace=0.34, left=0.055, right=0.97,
-        top=0.905, bottom=0.035)
+        top=0.905, bottom=0.02)
     overall_grid = grid[0, :].subgridspec(1, 3, wspace=0.34)
     left_grid = overall_grid[0].subgridspec(
         2, 1, height_ratios=[3.2, 1.25], hspace=0.08)
@@ -1935,7 +1563,7 @@ def _render_feature_figure_body(fig, analysis, info, params, plt, png_path,
     ax_woe_heat = fig.add_subplot(grid[2, 0:3])
     ax_share_heat = fig.add_subplot(grid[2, 3:6])
     ax_psi = fig.add_subplot(grid[3, :])
-    ax_diag = fig.add_subplot(grid[4, :])
+    ax_reason = fig.add_subplot(grid[4, :])
 
     title = "特征分析：{}".format(feature)
     if export_name != feature:
@@ -1962,28 +1590,26 @@ def _render_feature_figure_body(fig, analysis, info, params, plt, png_path,
     fig.text(0.01, 0.947,
              "训练 IV={} | OOT IV={} | iv_min={} | PSI={} | 缺失率={} | "
              "普通箱={} | 训练方向={}".format(
-                 _fmt_float(diagnostics["iv_train"]),
-                 _fmt_float(diagnostics["iv_oot"]),
-                 _fmt_float(diagnostics["iv_min"]),
+                 _fmt_float(reason["iv_train"]),
+                 _fmt_float(reason["iv_oot"]),
+                 _fmt_float(reason["iv_min"]),
                  _fmt_float(info.get("psi", np.nan)),
                  _fmt_pct(info.get("missing_rate", np.nan)),
-                 diagnostics["n_normal_bins"], diagnostics["train_direction"]),
+                 reason["n_normal_bins"], reason["train_direction"]),
              fontsize=9, ha="left", va="top")
     fig.text(0.01, 0.929,
-             ("注：OOT 参与分箱方案选择，不是独立验证集；OOT 未覆盖样本={}；"
-              "诊断为报告层辅助判断，不改变筛选结果。".format(
-                  int(round(meta["oot_uncovered"])))
+             ("注：OOT 参与分箱方案选择，不是独立验证集；OOT 未覆盖样本={}。"
+              .format(int(round(meta["oot_uncovered"])))
               if meta["oot_enabled"] else
-              "注：未启用 OOT，OOT 相关指标为 NA，无法据此判断时间外稳定性；"
-              "诊断为报告层辅助判断，不改变筛选结果。"),
+              "注：未启用 OOT，OOT 相关指标为 NA。"),
              fontsize=7.8, color="#555555", ha="left", va="top")
 
     _plot_share_panel(ax_share, ax_table, ordered, meta, info,
-                      short_labels, params["diag_min_bin_n"])
+                      short_labels, params["plot_min_bin_n"])
     _plot_woe_panel(ax_woe, ordered, meta, short_labels,
-                    params["diag_min_bin_n"])
+                    params["plot_min_bin_n"])
     _plot_iv_panel(ax_iv, ordered, meta, info, short_labels,
-                   params["diag_min_bin_n"], params["diag_iv_floor"])
+                   params["plot_min_bin_n"], params["plot_iv_floor"])
 
     tick_labels = []
     for index in range(n_periods):
@@ -1998,30 +1624,19 @@ def _render_feature_figure_body(fig, analysis, info, params, plt, png_path,
     trend_info["_train_bad_rate"] = meta["train_bad_rate"]
     _plot_time_trend(trend_axes, periods, matrices, trend_info,
                      period_context, params["max_psi"],
-                     params["diag_min_period_n"], tick_labels)
+                     params["plot_min_period_n"], tick_labels)
     _plot_woe_heatmap(ax_woe_heat, ordered, matrices, periods,
                       period_context, short_labels,
-                      params["diag_min_bin_n"], plt)
+                      params["plot_min_bin_n"], plt)
     _plot_share_heatmap(ax_share_heat, matrices, periods, period_context,
                         short_labels, plt)
     _plot_psi_panel(ax_psi, ordered, matrices, periods, period_context,
                     short_labels, params["max_psi"])
 
-    conclusion = diagnostics["conclusion"]
-    color = {"保留": "#1B7F3A", "观察": "#B7791F",
-             "建议复查": "#C0392B"}.get(conclusion, "#222222")
-    ax_diag.axis("off")
-    ax_diag.text(0.0, 0.98, "结论：{}".format(conclusion),
-                 fontsize=12, weight="bold", color=color, va="top")
-    ax_diag.text(0.0, 0.73, textwrap.fill(
-        "依据：" + diagnostics["evidence"], width=165),
-        fontsize=8.0, va="top")
-    ax_diag.text(0.0, 0.39, textwrap.fill(
-        "限制：" + diagnostics["limitations"], width=165),
-        fontsize=7.4, color="#555555", va="top")
-    ax_diag.text(0.0, 0.10, textwrap.fill(
-        "诊断阈值：" + diagnostics["thresholds"], width=165),
-        fontsize=6.8, color="#777777", va="top")
+    ax_reason.axis("off")
+    ax_reason.text(0.0, 0.92, textwrap.fill(
+        reason["candidate_reason"], width=150),
+        fontsize=9.4, weight="bold", color="#1B7F3A", va="top")
 
     fig.savefig(str(png_path), dpi=params["plot_dpi"],
                 bbox_inches="tight", facecolor="white")
@@ -2042,28 +1657,9 @@ def _render_feature_figure(analysis, info, params, plt, png_path,
 
 _INDEX_COLUMNS = [
     "original_feature", "export_name", "plot_png", "plot_pdf",
-    "plot_status", "plot_error", "conclusion", "evidence",
-    "name_collision", "collision_group", "notes",
-]
-_DIAGNOSTIC_COLUMNS = [
-    "feature", "export_name", "plot_status", "plot_error", "plot_png",
-    "plot_pdf", "conclusion", "evidence", "severe_issues", "warnings",
-    "limitations", "thresholds", "iv_train", "iv_oot", "iv_min",
-    "iv_change_pct", "iv_missing", "iv_missing_share", "n_normal_bins",
-    "max_iv_bin", "max_iv_bin_n", "max_iv_share", "max_iv_bin_small",
-    "small_bin_concentrated", "n_low_bins", "n_zero_good_bins",
-    "n_zero_bad_bins", "train_direction", "oot_direction",
-    "direction_consistent", "n_periods", "n_cross_periods",
-    "n_low_periods", "n_invalid_periods", "n_empty_cells", "n_low_cells",
-    "n_zero_good_cells", "n_zero_bad_cells", "n_reversal_periods",
-    "n_clear_reversal_periods", "n_jump_steps", "max_period_psi",
-    "max_period_psi_label", "max_reliable_period_psi",
-    "max_reliable_period_psi_label", "max_psi_contrib_bin",
-    "max_psi_contrib_value", "max_reliable_psi_contrib_bin",
-    "max_reliable_psi_contrib_value",
-    "psi_sum_max_diff", "coverage_all", "coverage_oot",
-    "min_period_coverage", "uncovered_total", "uncovered_oot",
-    "date_gap_count", "oot_iv_recomputed", "oot_iv_check", "time_freq",
+    "plot_status", "plot_error", "candidate_reason",
+    "iv_train", "iv_oot", "iv_min", "psi", "missing_rate",
+    "name_collision", "collision_group",
 ]
 _TIME_COLUMNS = [
     "feature", "export_name", "period", "period_start", "period_end",
@@ -2107,7 +1703,7 @@ def _setup_matplotlib():
 def generate_feature_analysis_plots(data, train, oot, target, summary,
                                     bin_detail, oot_mask, output_root,
                                     params):
-    """对去重后的最终候选特征批量生成分析图、索引和诊断 CSV。"""
+    """对去重后的最终候选特征批量生成分析图、图片索引和分期明细。"""
     selected = summary.loc[summary["selected"], "feature"].tolist()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = (Path(output_root)
@@ -2115,28 +1711,21 @@ def generate_feature_analysis_plots(data, train, oot, target, summary,
     plots_dir = run_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
     index_path = run_dir / "image_index.csv"
-    diagnostics_path = run_dir / "diagnostics.csv"
     time_path = run_dir / "time_bin_detail.csv"
+    empty_index = pd.DataFrame(columns=_INDEX_COLUMNS)
+    empty_time = pd.DataFrame(columns=_TIME_COLUMNS)
     if not selected:
-        pd.DataFrame(columns=_INDEX_COLUMNS).to_csv(
-            index_path, index=False, encoding="utf-8-sig")
-        pd.DataFrame(columns=_DIAGNOSTIC_COLUMNS).to_csv(
-            diagnostics_path, index=False, encoding="utf-8-sig")
-        pd.DataFrame(columns=_TIME_COLUMNS).to_csv(
-            time_path, index=False, encoding="utf-8-sig")
+        empty_index.to_csv(index_path, index=False, encoding="utf-8-sig")
+        empty_time.to_csv(time_path, index=False, encoding="utf-8-sig")
         print("最终候选为空，未生成分析图；空结果目录：{}".format(run_dir))
         return {"run_dir": run_dir, "success": 0, "failed": 0,
-                "index": pd.DataFrame(columns=_INDEX_COLUMNS),
-                "diagnostics": pd.DataFrame(columns=_DIAGNOSTIC_COLUMNS),
-                "time_detail": pd.DataFrame(columns=_TIME_COLUMNS)}
+                "index": empty_index, "time_detail": empty_time}
     try:
         plt = _setup_matplotlib()
     except RuntimeError as exc:
         print("绘图初始化失败：{}；本次仅输出筛选结果。".format(exc))
         return {"run_dir": run_dir, "success": 0, "failed": len(selected),
-                "index": pd.DataFrame(columns=_INDEX_COLUMNS),
-                "diagnostics": pd.DataFrame(columns=_DIAGNOSTIC_COLUMNS),
-                "time_detail": pd.DataFrame(columns=_TIME_COLUMNS)}
+                "index": empty_index, "time_detail": empty_time}
 
     labels = data[target].to_numpy(dtype=float)
     if oot is not None and oot_mask is not None:
@@ -2155,7 +1744,7 @@ def generate_feature_analysis_plots(data, train, oot, target, summary,
             period_context["periods"].loc[
                 period_context["first_oot"], "period_label"]))
     if period_context["gaps"]:
-        print("  时间缺口 {} 个，明细见 diagnostics.csv".format(
+        print("  时间缺口 {} 个，明细见 time_bin_detail.csv".format(
             len(period_context["gaps"])))
 
     export_names = {
@@ -2166,87 +1755,67 @@ def generate_feature_analysis_plots(data, train, oot, target, summary,
     detail_groups = {feature: group
                      for feature, group in bin_detail.groupby("feature")}
     info_map = summary.set_index("feature").to_dict("index")
-    index_rows, diagnostic_rows, time_rows = [], [], []
+    index_rows, time_rows = [], []
     failures = []
     for position, feature in enumerate(selected, 1):
         export_name = export_names[feature]
         file_stem = "{:04d}_{}".format(position, _safe_filename(export_name))
         png_path = plots_dir / (file_stem + ".png")
         pdf_path = plots_dir / (file_stem + ".pdf") if params["plot_pdf"] else None
+        info = info_map.get(feature, {})
+        reason = None
         status, error = "成功", ""
         try:
             detail = detail_groups.get(feature)
             if detail is None:
                 raise ValueError("bin_detail 中缺少该特征的分箱结果")
-            info = info_map[feature]
             analysis = _prepare_feature_analysis(
                 feature, export_name, detail.copy(), info, data, target,
                 train, oot, period_context, params)
+            reason = dict(analysis["reason"])
             _render_feature_figure(
                 analysis, info, params, plt, png_path, pdf_path)
-            diagnostic = dict(analysis["diagnostics"])
             time_detail = analysis["time_long"]
             time_detail.insert(0, "export_name", export_name)
             time_detail.insert(0, "feature", feature)
             time_rows.append(time_detail)
-            index_rows.append({
-                "original_feature": feature,
-                "export_name": export_name,
-                "plot_png": str(png_path),
-                "plot_pdf": str(pdf_path) if pdf_path is not None else "",
-                "plot_status": status,
-                "plot_error": error,
-                "conclusion": diagnostic["conclusion"],
-                "evidence": diagnostic["evidence"],
-                "name_collision": export_name in collision_groups,
-                "collision_group": (export_name
-                                    if export_name in collision_groups else ""),
-                "notes": diagnostic["limitations"],
-            })
         except Exception as exc:
             status = "失败"
             error = "{}: {}".format(type(exc).__name__, exc)
             failures.append((feature, error))
             print("警告：特征 {} 绘图失败：{}".format(feature, error))
-            diagnostic = {
-                "feature": feature, "export_name": export_name,
-                "conclusion": "观察",
-                "evidence": "绘图失败，未完成诊断：{}".format(error),
-                "severe_issues": "", "warnings": "绘图失败",
-                "limitations": "绘图失败，结果未评估",
-                "thresholds": "",
-            }
-            index_rows.append({
-                "original_feature": feature,
-                "export_name": export_name,
-                "plot_png": str(png_path),
-                "plot_pdf": str(pdf_path) if pdf_path is not None else "",
-                "plot_status": status,
-                "plot_error": error,
-                "conclusion": diagnostic["conclusion"],
-                "evidence": diagnostic["evidence"],
-                "name_collision": export_name in collision_groups,
-                "collision_group": (export_name
-                                    if export_name in collision_groups else ""),
-                "notes": diagnostic["limitations"],
-            })
-        diagnostic.update({
-            "feature": feature, "export_name": export_name,
-            "plot_status": status, "plot_error": error,
+            if reason is None:
+                reason = {
+                    "candidate_reason": "分析失败：{}".format(error),
+                    "iv_train": info.get("iv", np.nan),
+                    "iv_oot": info.get("oot_iv", np.nan),
+                    "iv_min": info.get("iv_min", np.nan),
+                    "psi": info.get("psi", np.nan),
+                    "missing_rate": info.get("missing_rate", np.nan),
+                }
+        index_rows.append({
+            "original_feature": feature,
+            "export_name": export_name,
             "plot_png": str(png_path),
             "plot_pdf": str(pdf_path) if pdf_path is not None else "",
+            "plot_status": status,
+            "plot_error": error,
+            "candidate_reason": reason["candidate_reason"],
+            "iv_train": reason.get("iv_train", np.nan),
+            "iv_oot": reason.get("iv_oot", np.nan),
+            "iv_min": reason.get("iv_min", np.nan),
+            "psi": reason.get("psi", np.nan),
+            "missing_rate": reason.get("missing_rate", np.nan),
+            "name_collision": export_name in collision_groups,
+            "collision_group": (export_name
+                                if export_name in collision_groups else ""),
         })
-        diagnostic_rows.append(diagnostic)
         if position % 10 == 0 or position == len(selected):
             print("分析绘图：{}/{}".format(position, len(selected)))
     index_frame = pd.DataFrame(index_rows, columns=_INDEX_COLUMNS)
-    diagnostic_frame = pd.DataFrame(
-        diagnostic_rows, columns=_DIAGNOSTIC_COLUMNS)
     time_frame = (pd.concat(time_rows, ignore_index=True)
-                  if time_rows else pd.DataFrame(columns=_TIME_COLUMNS))
+                  if time_rows else empty_time)
     index_frame.to_csv(index_path, index=False, encoding="utf-8-sig")
-    diagnostic_frame.to_csv(
-        diagnostics_path, index=False, encoding="utf-8-sig")
     time_frame.to_csv(time_path, index=False, encoding="utf-8-sig")
     success = int((index_frame["plot_status"] == "成功").sum())
     failed = len(index_frame) - success
@@ -2258,8 +1827,7 @@ def generate_feature_analysis_plots(data, train, oot, target, summary,
         success, failed, run_dir))
     result = {
         "run_dir": run_dir, "success": success, "failed": failed,
-        "index": index_frame, "diagnostics": diagnostic_frame,
-        "time_detail": time_frame,
+        "index": index_frame, "time_detail": time_frame,
     }
     return result
 
@@ -2275,14 +1843,9 @@ def run_feature_screening(root_dir, min_iv=0.02, n_bins=5,
                           dedup_corr=0.8,
                           plot_results=True, plot_pdf=False, plot_dpi=200,
                           time_freq="week",
-                          diag_min_bin_n=30, diag_min_bin_good=5,
-                          diag_min_bin_bad=5, diag_min_period_n=100,
-                          diag_min_coverage=0.99, diag_review_coverage=0.90,
-                          diag_max_bin_iv_share=0.5,
-                          diag_small_bin_iv_share=0.3,
-                          diag_direction_tol=0.05,
-                          diag_jump_bad_rate=0.10,
-                          diag_psi_review=0.5, diag_iv_floor=1e-6):
+                          plot_min_bin_n=30, plot_min_bin_good=5,
+                          plot_min_bin_bad=5, plot_min_period_n=100,
+                          plot_iv_floor=1e-6):
     """读取指定的样本表/变量表，按指定标签筛选特征。
 
     返回 data, summary, bin_detail, candidates。
@@ -2302,22 +1865,15 @@ def run_feature_screening(root_dir, min_iv=0.02, n_bins=5,
     n_bins/n_prebins/min_bin_pct 控制分箱。
 
     分析绘图（去重完成后仅对最终候选特征执行，不改变筛选结果）：
-    plot_results: 是否生成分析图与诊断；默认开启。
+    plot_results: 是否生成分析图、候选原因和明细；默认开启。
     plot_pdf: 是否同时导出 PDF；默认只导出 PNG。
     plot_dpi: PNG 分辨率，默认 200，支持 200~300。
     time_freq: 分期粒度 day/week/month，默认 week；一次运行内所有特征一致。
-    diag_min_bin_n / diag_min_bin_good / diag_min_bin_bad: 分箱可靠性提示
-        阈值（样本量、好样本、坏样本），默认 30/5/5。
-    diag_min_period_n: 期间样本量提示阈值，默认 100。
-    diag_min_coverage: 覆盖率提示阈值，默认 0.99；diag_review_coverage:
-        覆盖率复查阈值，默认 0.90。
-    diag_max_bin_iv_share: 单箱 IV 贡献集中提示阈值，默认 0.50。
-    diag_small_bin_iv_share: 小样本箱贡献集中提示阈值，默认 0.30。
-    diag_direction_tol: 期间方向波动容差，默认 0.05。
-    diag_jump_bad_rate: 异常跳点的坏账率变化阈值，默认 0.10。
-    diag_psi_review: 期间 PSI 复查阈值，默认 0.5。
-    diag_iv_floor: 判断 IV≈0 的下限，默认 1e-6。
-    以上诊断阈值只用于报告提示，不是筛选标准。
+    plot_min_bin_n / plot_min_bin_good / plot_min_bin_bad: 图中标记
+        低样本箱的阈值（样本量、好样本、坏样本），默认 30/5/5。
+    plot_min_period_n: 图中标记低样本期间的阈值，默认 100。
+    plot_iv_floor: 判断 IV≈0 的下限，默认 1e-6。
+    以上阈值只影响图中的斜线标注和 PSI 参考线，不是筛选标准。
     """
     global LAST_ANALYSIS
     LAST_ANALYSIS = None
@@ -2337,25 +1893,13 @@ def run_feature_screening(root_dir, min_iv=0.02, n_bins=5,
     if not isinstance(plot_dpi, (int, np.integer)) or not 72 <= plot_dpi <= 600:
         raise ValueError("plot_dpi 必须是 72~600 的整数。")
     for name, value in [
-            ("diag_min_bin_n", diag_min_bin_n),
-            ("diag_min_bin_good", diag_min_bin_good),
-            ("diag_min_bin_bad", diag_min_bin_bad),
-            ("diag_min_period_n", diag_min_period_n),
-            ("diag_direction_tol", diag_direction_tol),
-            ("diag_jump_bad_rate", diag_jump_bad_rate),
-            ("diag_psi_review", diag_psi_review),
-            ("diag_iv_floor", diag_iv_floor)]:
+            ("plot_min_bin_n", plot_min_bin_n),
+            ("plot_min_bin_good", plot_min_bin_good),
+            ("plot_min_bin_bad", plot_min_bin_bad),
+            ("plot_min_period_n", plot_min_period_n),
+            ("plot_iv_floor", plot_iv_floor)]:
         if not np.isfinite(value) or value < 0:
             raise ValueError(name + " 必须为非负有限数值。")
-    for name, value in [
-            ("diag_min_coverage", diag_min_coverage),
-            ("diag_review_coverage", diag_review_coverage),
-            ("diag_max_bin_iv_share", diag_max_bin_iv_share),
-            ("diag_small_bin_iv_share", diag_small_bin_iv_share)]:
-        if not np.isfinite(value) or not 0 <= value <= 1:
-            raise ValueError(name + " 必须在 [0, 1] 内。")
-    if diag_review_coverage > diag_min_coverage:
-        raise ValueError("diag_review_coverage 不能大于 diag_min_coverage。")
     keys = ["user_id", "sample_datetime"]
     root = Path(root_dir)
     sample_columns = pd.read_csv(root / sample_file, nrows=0).columns
@@ -2534,21 +2078,15 @@ def run_feature_screening(root_dir, min_iv=0.02, n_bins=5,
             "min_iv": float(min_iv),
             "max_psi": float(max_psi),
             "max_missing_iv_share": max_missing_iv_share,
+            "dedup_corr": dedup_corr,
             "plot_pdf": bool(plot_pdf),
             "plot_dpi": int(plot_dpi),
             "time_freq": time_freq,
-            "diag_min_bin_n": int(diag_min_bin_n),
-            "diag_min_bin_good": int(diag_min_bin_good),
-            "diag_min_bin_bad": int(diag_min_bin_bad),
-            "diag_min_period_n": int(diag_min_period_n),
-            "diag_min_coverage": float(diag_min_coverage),
-            "diag_review_coverage": float(diag_review_coverage),
-            "diag_max_bin_iv_share": float(diag_max_bin_iv_share),
-            "diag_small_bin_iv_share": float(diag_small_bin_iv_share),
-            "diag_direction_tol": float(diag_direction_tol),
-            "diag_jump_bad_rate": float(diag_jump_bad_rate),
-            "diag_psi_review": float(diag_psi_review),
-            "diag_iv_floor": float(diag_iv_floor),
+            "plot_min_bin_n": int(plot_min_bin_n),
+            "plot_min_bin_good": int(plot_min_bin_good),
+            "plot_min_bin_bad": int(plot_min_bin_bad),
+            "plot_min_period_n": int(plot_min_period_n),
+            "plot_iv_floor": float(plot_iv_floor),
         }
         LAST_ANALYSIS = generate_feature_analysis_plots(
             data, train, oot, target, summary, bin_detail, oot_mask,
