@@ -22,7 +22,8 @@ selected、reason、候选清单或分箱边界。绘图依赖 matplotlib。
 
 结果按样本表文件名、变量表文件名和标签归档到
 {根目录}/feature_screening_reports/{样本文件名}_{变量表文件名}_{标签名}/，
-同一组合重复运行会覆盖同名文件；分析图按特征名命名。
+同一组合重复运行会覆盖同名文件；分析图按特征名命名，绘图完成后自动打包为
+同目录下的 {样本文件名}_{变量表文件名}_{标签名}_plots.zip，便于下载。
 
 大数据/线上运行：
 - feature_chunk_size: 按变量分块读取和筛选，显著降低峰值内存；None 表示
@@ -40,6 +41,7 @@ import textwrap
 import re
 import os
 import time
+import zipfile
 import numpy as np
 import pandas as pd
 
@@ -2344,6 +2346,23 @@ def _render_feature_task(payload):
         analysis, info, params, plt, plots_dir, file_stem)
 
 
+def _plots_archive_path(run_dir):
+    return run_dir / (run_dir.name + "_plots.zip")
+
+
+def _zip_plots(plots_dir, run_dir):
+    archive = _plots_archive_path(run_dir)
+    files = sorted(path for path in plots_dir.rglob("*") if path.is_file())
+    if not files:
+        if archive.exists():
+            archive.unlink()
+        return None
+    with zipfile.ZipFile(str(archive), "w", zipfile.ZIP_DEFLATED) as zf:
+        for path in files:
+            zf.write(str(path), path.relative_to(plots_dir).as_posix())
+    return archive
+
+
 def generate_feature_analysis_plots(data, train, oot, target, summary,
                                     bin_detail, oot_mask, run_dir,
                                     params):
@@ -2384,6 +2403,9 @@ def generate_feature_analysis_plots(data, train, oot, target, summary,
         empty_index.to_csv(index_path, index=False, encoding="utf-8-sig")
         empty_time.to_csv(time_path, index=False, encoding="utf-8-sig")
         remove_plots(previous_plots)
+        archive = _plots_archive_path(run_dir)
+        if archive.exists():
+            remove_plots([archive])
         print("没有可绘图的变量，未生成分析图；空结果目录：{}".format(run_dir))
         return {"run_dir": run_dir, "success": 0, "failed": 0,
                 "index": empty_index, "time_detail": empty_time}
@@ -2556,6 +2578,11 @@ def generate_feature_analysis_plots(data, train, oot, target, summary,
             if row[column]:
                 current_plots.add(Path(row[column]).resolve())
     remove_plots(previous_plots - current_plots)
+    archive = None
+    try:
+        archive = _zip_plots(plots_dir, run_dir)
+    except Exception as exc:
+        print("警告：绘图压缩失败：{}".format(exc))
     if index_frame.empty:
         success, failed = 0, 0
     else:
@@ -2570,9 +2597,12 @@ def generate_feature_analysis_plots(data, train, oot, target, summary,
             print("  - {}：{}".format(feature, error))
     print("分析图完成：成功 {} 个特征，失败 {} 个特征，共 {} 张图；目录：{}"
           .format(success, failed, len(index_frame), run_dir))
+    if archive is not None:
+        print("绘图压缩包：{}".format(archive))
     result = {
         "run_dir": run_dir, "success": success, "failed": failed,
         "index": index_frame, "time_detail": time_frame,
+        "archive": archive,
     }
     return result
 
@@ -2615,7 +2645,9 @@ def run_feature_screening(root_dir, min_iv=0.02, n_bins=5,
 
     结果写入
     {根目录}/feature_screening_reports/{样本文件名}_{变量表文件名}_{标签名}/，
-    文件名不含日期；同一组合重复运行覆盖同名文件，分析图按特征名命名。
+    文件名不含日期；同一组合重复运行覆盖同名文件，分析图按特征名命名；
+    绘图完成后 plots 目录自动打包为同目录下的
+    {样本文件名}_{变量表文件名}_{标签名}_plots.zip。
 
     分析绘图（默认对去重后的最终候选特征执行，不改变筛选结果）：
     plot_results: 是否生成分析图、候选原因和明细；默认开启。
