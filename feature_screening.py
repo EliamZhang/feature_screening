@@ -1318,152 +1318,126 @@ def _add_wrapped_fig_text(fig, x, y, text, fontsize, color="#111111",
 
 
 def _plot_share_panel(ax, ax_table, ordered, meta, info, short_labels,
-                      min_bin_n):
+                      min_bin_n, table_labels=None, range_labels=None):
+    """整体分箱图：样本占比柱 + 坏账率线；右侧表格给出可核对数值。"""
     oot_enabled = meta["oot_enabled"]
     count = len(ordered)
     x = np.arange(count)
     width = 0.38 if oot_enabled else 0.68
     train_total = max(meta["train_total"], 1)
-    share_train = ordered["n"].to_numpy(dtype=float) / train_total * 100.0
+    train_n = ordered["n"].to_numpy(dtype=float)
+    share_train = train_n / train_total * 100.0
     bars_train = ax.bar(
         x - (width / 2.0 if oot_enabled else 0.0), share_train, width,
-        color=_TRAIN_COLOR, alpha=0.82, edgecolor="white",
+        color=_TRAIN_COLOR, alpha=0.84, edgecolor="white",
         linewidth=0.6, label="Train share", zorder=2)
     bars_oot = None
+    share_oot = np.zeros(count, dtype=float)
+    oot_n = np.zeros(count, dtype=float)
     if oot_enabled:
         oot_total = max(meta["oot_total"], 1)
-        share_oot = ordered["oot_n"].to_numpy(dtype=float) / oot_total * 100.0
+        oot_n = ordered["oot_n"].to_numpy(dtype=float)
+        share_oot = oot_n / oot_total * 100.0
         bars_oot = ax.bar(
             x + width / 2.0, share_oot, width, color=_OOT_COLOR,
-            alpha=0.72, edgecolor="white", linewidth=0.6,
+            alpha=0.78, edgecolor="white", linewidth=0.6,
             label="OOT share", zorder=2)
     is_missing = ordered["is_missing"].to_numpy(dtype=bool)
     for index in range(count):
-        for bars, values in [(bars_train, ordered["n"].to_numpy(dtype=float)),
-                             (bars_oot,
-                              ordered["oot_n"].to_numpy(dtype=float)
-                              if oot_enabled else None)]:
+        for bars, values in ((bars_train, train_n), (bars_oot, oot_n)):
             if bars is None:
                 continue
             patch = bars[index]
             if is_missing[index]:
                 patch.set_facecolor(_MISSING_COLOR)
                 patch.set_hatch("//")
-            if values is not None and 0 < values[index] < min_bin_n:
+            if 0 < values[index] < min_bin_n:
                 patch.set_edgecolor(_THRESHOLD_COLOR)
                 patch.set_linewidth(1.3)
+
     ax.set_ylabel("Sample share (%)", fontsize=_FS_AXIS_LABEL)
     ax.set_xticks(x)
-    ax.set_xticklabels(short_labels, rotation=20, ha="right",
-                       fontsize=_FS_TICK)
-    ax.tick_params(axis="x", pad=4)
-    upper = np.nanmax(share_train) if np.isfinite(share_train).any() else 10.0
-    if oot_enabled:
-        oot_share = (ordered["oot_n"].to_numpy(dtype=float)
-                     / max(meta["oot_total"], 1) * 100.0)
-        if np.isfinite(oot_share).any():
-            upper = max(upper, float(np.nanmax(oot_share)))
+    ax.set_xticklabels([])
+    ax.tick_params(axis="x", length=0, pad=1)
+    upper = max(float(np.nanmax(share_train)) if len(share_train) else 0.0,
+                float(np.nanmax(share_oot)) if oot_enabled and len(share_oot) else 0.0)
     ax.set_ylim(0, max(upper * 1.30, 5.0))
-    ax.set_title("Bin share and bad rate (train vs OOT)"
-                 if oot_enabled else "Bin share and bad rate (train only)",
-                 fontsize=_FS_PANEL_TITLE, loc="left", pad=8)
-    ax.text(0.01, 0.98,
-            "Bars = sample share; line = bad rate (95% Wilson CI)\n"
-            "Grey hatch = missing bin; red edge = low sample.",
-            transform=ax.transAxes, fontsize=_FS_NOTE, color="#555555",
-            va="top", bbox=dict(facecolor="white", alpha=0.86,
-                                edgecolor="none", pad=1.2), zorder=6)
+    ax.set_title("Bin share + bad rate (Train vs OOT)" if oot_enabled
+                 else "Bin share + bad rate (Train)",
+                 fontsize=_FS_PANEL_TITLE, loc="left", pad=7)
+
     ax2 = ax.twinx()
     ordinary = ~is_missing
     train_rate = ordered["bad_rate"].to_numpy(dtype=float) * 100.0
     valid = ordinary & np.isfinite(train_rate)
     ax2.plot(x[valid], train_rate[valid], color=_TRAIN_COLOR,
-             marker="o", lw=1.7, label="Train bad rate", zorder=3)
+             marker="o", lw=1.7, ms=4, label="Train bad rate", zorder=3)
     ax2.errorbar(
         x[valid], train_rate[valid],
         yerr=_rate_yerr(train_rate[valid],
                         ordered["ci_low"].to_numpy(dtype=float)[valid] * 100.0,
                         ordered["ci_high"].to_numpy(dtype=float)[valid] * 100.0),
-        fmt="none", ecolor=_TRAIN_COLOR, elinewidth=1, capsize=2.5,
-        alpha=0.8, zorder=3)
-    missing_mask = is_missing & np.isfinite(train_rate)
-    if missing_mask.any():
-        ax2.scatter(x[missing_mask], train_rate[missing_mask],
-                    color=_TRAIN_COLOR, marker="D", s=26, zorder=4,
-                    label="Train missing bin")
+        fmt="none", ecolor=_TRAIN_COLOR, elinewidth=0.9, capsize=2,
+        alpha=0.7, zorder=3)
     if oot_enabled:
         oot_rate = ordered["oot_bad_rate"].to_numpy(dtype=float) * 100.0
         oot_valid = ordinary & np.isfinite(oot_rate)
         ax2.plot(x[oot_valid], oot_rate[oot_valid], color=_OOT_COLOR,
-                 marker="s", lw=1.4, ls="--", label="OOT bad rate", zorder=3)
+                 marker="s", lw=1.4, ls="--", ms=3.5,
+                 label="OOT bad rate", zorder=3)
         ax2.errorbar(
             x[oot_valid], oot_rate[oot_valid],
             yerr=_rate_yerr(
                 oot_rate[oot_valid],
                 ordered["oot_ci_low"].to_numpy(dtype=float)[oot_valid] * 100.0,
                 ordered["oot_ci_high"].to_numpy(dtype=float)[oot_valid] * 100.0),
-            fmt="none", ecolor=_OOT_COLOR, elinewidth=0.9, capsize=2.2,
-            alpha=0.75, zorder=3)
-        oot_missing = is_missing & np.isfinite(oot_rate)
-        if oot_missing.any():
-            ax2.scatter(x[oot_missing], oot_rate[oot_missing],
-                        color=_OOT_COLOR, marker="D", s=22, zorder=4,
-                        label="OOT missing bin")
+            fmt="none", ecolor=_OOT_COLOR, elinewidth=0.8, capsize=2,
+            alpha=0.65, zorder=3)
     ax2.axhline(meta["train_bad_rate"] * 100.0, color=_TRAIN_COLOR,
-                ls=":", lw=1.0, alpha=0.7, label="Train overall bad rate")
+                ls=":", lw=1.0, alpha=0.7, label="Train overall")
     if oot_enabled:
         ax2.axhline(meta["oot_bad_rate"] * 100.0, color=_OOT_COLOR,
-                    ls=":", lw=1.0, alpha=0.7, label="OOT overall bad rate")
+                    ls=":", lw=1.0, alpha=0.7, label="OOT overall")
     ax2.set_ylabel("Bad rate (%)", fontsize=_FS_AXIS_LABEL)
     ax2.tick_params(axis="y", labelsize=_FS_TICK)
-    max_rate = np.nanmax(train_rate) if np.isfinite(train_rate).any() else 10.0
+    rates = [train_rate[np.isfinite(train_rate)]]
     if oot_enabled:
-        oot_rate_all = ordered["oot_bad_rate"].to_numpy(dtype=float) * 100.0
-        if np.isfinite(oot_rate_all).any():
-            max_rate = max(max_rate, float(np.nanmax(oot_rate_all)))
+        rates.append(ordered["oot_bad_rate"].to_numpy(dtype=float) * 100.0)
+    finite_rates = np.concatenate([v[np.isfinite(v)] for v in rates if len(v)]) if any(len(v) for v in rates) else np.array([])
+    max_rate = float(finite_rates.max()) if len(finite_rates) else 5.0
     ax2.set_ylim(0, max(max_rate * 1.35, 5.0))
+    ax.grid(axis="y", color="#E8E8E8", lw=0.6, zorder=0)
+    ax.set_axisbelow(True)
 
     handles1, labels1 = ax.get_legend_handles_labels()
     handles2, labels2 = ax2.get_legend_handles_labels()
-    legend_handles = handles1 + [
-        handle for handle, label in zip(handles2, labels2)
-        if "missing bin" not in label]
-    legend_labels = labels1 + [
-        label for label in labels2 if "missing bin" not in label]
+    legend_handles = handles1 + handles2
+    legend_labels = labels1 + labels2
 
-    ax_table.axis("off")
-    row_labels, cell_text = [], []
+    rows = []
+    low_flags = []
+    table_labels = table_labels or short_labels
+    range_labels = range_labels or ["" for _ in table_labels]
+    for i, label in enumerate(table_labels):
+        row = [label, range_labels[i], _fmt_n(train_n[i]), _fmt_pct(share_train[i] / 100.0),
+               _fmt_pct(ordered["bad_rate"].iloc[i])]
+        if oot_enabled:
+            row += [_fmt_n(oot_n[i]), _fmt_pct(share_oot[i] / 100.0),
+                    _fmt_pct(ordered["oot_bad_rate"].iloc[i])]
+        rows.append(row)
+        low_flags.append(0 < train_n[i] < min_bin_n or
+                         (oot_enabled and 0 < oot_n[i] < min_bin_n))
+    columns = ["Bin", "Range", "Train n", "Train share", "Train bad%"]
+    widths = ([0.08, 0.20, 0.12, 0.13, 0.14] if oot_enabled
+              else [0.12, 0.34, 0.16, 0.18, 0.20])
     if oot_enabled:
-        row_labels = ["Train n", "Train bad", "OOT n", "OOT bad"]
-        cell_text = [
-            [_fmt_n(value) for value in ordered["n"]],
-            [_fmt_n(value) for value in ordered["bad"]],
-            [_fmt_n(value) for value in ordered["oot_n"]],
-            [_fmt_n(value) for value in ordered["oot_bad"]],
-        ]
-    else:
-        row_labels = ["Train n", "Train bad"]
-        cell_text = [
-            [_fmt_n(value) for value in ordered["n"]],
-            [_fmt_n(value) for value in ordered["bad"]],
-        ]
-    table = ax_table.table(cellText=cell_text, rowLabels=row_labels,
-                           colLabels=short_labels, loc="center",
-                           cellLoc="center")
-    table.auto_set_font_size(False)
-    table.set_fontsize(_FS_TABLE if count <= 6 else _FS_TABLE - 0.5)
-    table.scale(1.0, 1.22)
-    for (row, col), cell in table.get_celld().items():
-        if row == 0:
-            cell.set_facecolor("#EDEDED")
-            cell.set_text_props(weight="bold")
-        if col >= 0 and is_missing[col]:
-            cell.set_facecolor("#F2F2F2")
-        cell.set_edgecolor("#D9D9D9")
-    ax_table.set_title("Bin detail (n = samples, bad = bad samples)",
-                       fontsize=_FS_AXIS_LABEL, pad=3)
+        columns += ["OOT n", "OOT share", "OOT bad%"]
+        widths += [0.11, 0.11, 0.11]
+    _draw_compact_table(
+        ax_table, rows, columns, missing_flags=is_missing,
+        low_flags=low_flags, fontsize=6.5,
+        title="Per-bin detail | counts and rates", col_widths=widths)
     return legend_handles, legend_labels
-
 
 def _plot_woe_panel(ax, ordered, meta, short_labels, min_bin_n):
     count = len(ordered)
@@ -1495,9 +1469,8 @@ def _plot_woe_panel(ax, ordered, meta, short_labels, min_bin_n):
                 patch.set_linewidth(1.2)
     ax.axhline(0, color="#333333", lw=0.8)
     ax.set_xticks(x)
-    ax.set_xticklabels(short_labels, rotation=20, ha="right",
-                       fontsize=_FS_TICK)
-    ax.tick_params(axis="x", pad=4)
+    ax.set_xticklabels([])
+    ax.tick_params(axis="x", length=0, pad=1)
     ax.set_ylabel("WOE", fontsize=_FS_AXIS_LABEL)
     ax.set_title("Bin WOE (positive = lower risk, negative = higher risk)",
                  fontsize=_FS_PANEL_TITLE, loc="left", pad=8)
@@ -1566,9 +1539,8 @@ def _plot_iv_panel(ax, ordered, meta, info, short_labels, min_bin_n,
         bars_train[max_index].set_edgecolor(_THRESHOLD_COLOR)
         bars_train[max_index].set_linewidth(2.0)
     ax.set_xticks(x)
-    ax.set_xticklabels(short_labels, rotation=20, ha="right",
-                       fontsize=_FS_TICK)
-    ax.tick_params(axis="x", pad=4)
+    ax.set_xticklabels([])
+    ax.tick_params(axis="x", length=0, pad=1)
     ax.set_ylabel("IV contribution", fontsize=_FS_AXIS_LABEL)
     ax.set_title("IV contribution (train vs OOT)" if meta["oot_enabled"]
                  else "IV contribution (train only, OOT disabled)",
@@ -1608,6 +1580,267 @@ def _plot_iv_panel(ax, ordered, meta, info, short_labels, min_bin_n,
     ax.set_ylim(0, max(upper, 1e-6))
     handles, labels = ax.get_legend_handles_labels()
     return handles, labels
+
+
+def _draw_compact_table(ax, rows, columns, missing_flags=None,
+                        low_flags=None, fontsize=7.0, title=None,
+                        col_widths=None):
+    """统一表格样式：表头浅灰、缺失箱灰底、低样本箱红色边框。"""
+    ax.axis("off")
+    if title:
+        ax.text(0.0, 0.99, title, transform=ax.transAxes,
+                fontsize=_FS_AXIS_LABEL, ha="left", va="top", color="#222222")
+    if not rows:
+        ax.text(0.5, 0.5, "No data", ha="center", va="center",
+                transform=ax.transAxes, color="#777777")
+        return None
+    table = ax.table(cellText=rows, colLabels=columns, loc="center",
+                     cellLoc="center", colLoc="center",
+                     colWidths=col_widths,
+                     bbox=[0.0, 0.075, 1.0, 0.82] if title else None)
+    table.auto_set_font_size(False)
+    table.set_fontsize(fontsize)
+    table.scale(1.0, 1.16)
+    missing_flags = list(missing_flags) if missing_flags is not None else [False] * len(rows)
+    low_flags = list(low_flags) if low_flags is not None else [False] * len(rows)
+    for (row, col), cell in table.get_celld().items():
+        cell.set_edgecolor("#D9DDE2")
+        cell.set_linewidth(0.45)
+        if row == 0:
+            cell.set_facecolor("#E9EDF2")
+            cell.set_text_props(weight="bold", color="#222222")
+        elif row - 1 < len(missing_flags) and missing_flags[row - 1]:
+            cell.set_facecolor("#F0F0F0")
+        elif row - 1 < len(low_flags) and low_flags[row - 1]:
+            cell.set_edgecolor(_THRESHOLD_COLOR)
+            cell.set_linewidth(0.9)
+    return table
+
+
+def _plot_woe_table(ax, ordered, meta, short_labels, min_bin_n,
+                    table_labels=None, range_labels=None):
+    oot_enabled = meta["oot_enabled"]
+    rows, low_flags = [], []
+    train_n = ordered["n"].to_numpy(dtype=float)
+    oot_n = (ordered["oot_n"].to_numpy(dtype=float)
+             if oot_enabled else np.zeros(len(ordered)))
+    table_labels = table_labels or short_labels
+    range_labels = range_labels or ["" for _ in table_labels]
+    for i, label in enumerate(table_labels):
+        row = [label, range_labels[i], _fmt_float(ordered["woe"].iloc[i], 3)]
+        if oot_enabled:
+            row.append(_fmt_float(ordered["oot_woe"].iloc[i], 3))
+        row.append(_fmt_n(train_n[i]))
+        if oot_enabled:
+            row.append(_fmt_n(oot_n[i]))
+        rows.append(row)
+        low_flags.append(0 < train_n[i] < min_bin_n or
+                         (oot_enabled and 0 < oot_n[i] < min_bin_n))
+    columns = ["Bin", "Range", "Train WOE"]
+    widths = ([0.09, 0.27, 0.17] if oot_enabled
+              else [0.12, 0.38, 0.20])
+    if oot_enabled:
+        columns.append("OOT WOE")
+        widths.append(0.17)
+    columns.append("Train n")
+    widths.append(0.15 if oot_enabled else 0.30)
+    if oot_enabled:
+        columns.append("OOT n")
+        widths.append(0.15)
+    _draw_compact_table(
+        ax, rows, columns, ordered["is_missing"].to_numpy(dtype=bool),
+        low_flags, fontsize=6.7, title="WOE values by bin", col_widths=widths)
+
+
+def _plot_iv_table(ax, ordered, meta, short_labels, info, min_bin_n,
+                   table_labels=None, range_labels=None):
+    oot_enabled = meta["oot_enabled"]
+    train_total_iv = float(info.get("iv", np.nan))
+    oot_total_iv = float(info.get("oot_iv", np.nan))
+    train_part = ordered["iv_part"].to_numpy(dtype=float)
+    oot_part = (ordered["oot_iv_part"].to_numpy(dtype=float)
+                if oot_enabled and "oot_iv_part" in ordered else np.full(len(ordered), np.nan))
+    rows, low_flags = [], []
+    train_n = ordered["n"].to_numpy(dtype=float)
+    oot_n = (ordered["oot_n"].to_numpy(dtype=float)
+             if oot_enabled else np.zeros(len(ordered)))
+    table_labels = table_labels or short_labels
+    range_labels = range_labels or ["" for _ in table_labels]
+    for i, label in enumerate(table_labels):
+        train_share = train_part[i] / train_total_iv if np.isfinite(train_total_iv) and train_total_iv > TOL else np.nan
+        row = [label, range_labels[i], _fmt_float(train_part[i], 4), _fmt_pct(train_share)]
+        if oot_enabled:
+            oot_share = oot_part[i] / oot_total_iv if np.isfinite(oot_total_iv) and oot_total_iv > TOL else np.nan
+            row += [_fmt_float(oot_part[i], 4), _fmt_pct(oot_share)]
+        rows.append(row)
+        low_flags.append(0 < train_n[i] < min_bin_n or
+                         (oot_enabled and 0 < oot_n[i] < min_bin_n))
+    columns = ["Bin", "Range", "Train IV", "Train share"]
+    widths = ([0.09, 0.27, 0.17, 0.17] if oot_enabled
+              else [0.12, 0.38, 0.22, 0.28])
+    if oot_enabled:
+        columns += ["OOT IV", "OOT share"]
+        widths += [0.15, 0.15]
+    title = "IV contribution | Train total {}".format(_fmt_float(train_total_iv, 4))
+    if oot_enabled:
+        title += " | OOT total {}".format(_fmt_float(oot_total_iv, 4))
+    _draw_compact_table(
+        ax, rows, columns, ordered["is_missing"].to_numpy(dtype=bool),
+        low_flags, fontsize=6.7, title=title, col_widths=widths)
+
+
+def _plot_period_summary_table(ax, periods, matrices, min_period_n, max_rows=8):
+    start = max(0, len(periods) - max_rows)
+    rows, low_flags = [], []
+    for i in range(start, len(periods)):
+        row = periods.iloc[i]
+        low = float(row["n_total"]) < min_period_n
+        split = str(row["split"])
+        split_display = {"训练": "Train", "OOT": "OOT", "跨界": "Cross"}.get(split, split)
+        period_label = str(row["period_label"]) + ("*" if split == "跨界" else "")
+        rows.append([
+            period_label, split_display, _fmt_n(row["n_total"]),
+            _fmt_pct(matrices["bad_rate"][i]),
+            _fmt_float(matrices["period_iv"][i], 3),
+            _fmt_float(matrices["period_psi"][i], 3),
+        ])
+        low_flags.append(low)
+    _draw_compact_table(
+        ax, rows, ["Period", "Split", "N", "Bad rate", "IV", "PSI"],
+        low_flags=low_flags, fontsize=6.7,
+        title="Recent periods (last {})".format(min(max_rows, len(periods))))
+    ax.text(0.01, 0.015, "* = crossing period; red border = low sample",
+            transform=ax.transAxes, fontsize=6.5, color="#666666", va="bottom")
+
+
+def _plot_bin_time_table(ax, matrices, periods, short_labels, metric,
+                         min_bin_n, min_period_n):
+    """逐箱展示训练期基准、最新值、变化量及最新样本量。"""
+    values = np.asarray(matrices[metric], dtype=float)
+    if values.ndim != 2:
+        values = values.reshape(-1, 1)
+    n_periods, n_bins = values.shape
+    split = periods["split"].astype(str).to_numpy()
+    train_mask = split == "训练"
+    if not train_mask.any():
+        first_oot = np.flatnonzero(split != "训练")
+        cutoff = int(first_oot[0]) if len(first_oot) else max(n_periods - 1, 0)
+        train_mask = np.arange(n_periods) < cutoff
+    if not train_mask.any() and n_periods > 1:
+        train_mask[:-1] = True
+    rows, missing_flags, low_flags = [], [], []
+    is_missing = matrices["ordered_detail"]["is_missing"].to_numpy(dtype=bool)
+    for b in range(n_bins):
+        col = values[:, b]
+        finite = np.isfinite(col)
+        if metric == "sample_pct":
+            reliable = finite & (matrices["bin_n"][:, b] > 0) & (matrices["total_n"] >= min_period_n)
+        else:
+            reliable = (finite & ~matrices["low_n"][:, b]
+                        & ~matrices["zero_good"][:, b]
+                        & ~matrices["zero_bad"][:, b]
+                        & ~matrices["low_good"][:, b]
+                        & ~matrices["low_bad"][:, b]
+                        & (matrices["total_n"] >= min_period_n))
+        base_values = col[train_mask & reliable]
+        base = float(np.nanmedian(base_values)) if len(base_values) else np.nan
+        available = np.flatnonzero(finite)
+        latest_idx = int(available[-1]) if len(available) else None
+        latest = col[latest_idx] if latest_idx is not None else np.nan
+        latest_n = matrices["bin_n"][latest_idx, b] if latest_idx is not None else np.nan
+        low = (latest_idx is None or not np.isfinite(latest_n)
+               or latest_n < min_bin_n
+               or matrices["total_n"][latest_idx] < min_period_n)
+        delta = latest - base if np.isfinite(latest) and np.isfinite(base) else np.nan
+        if metric == "woe":
+            base_text, latest_text, delta_text = (_fmt_float(base, 3),
+                                                  _fmt_float(latest, 3),
+                                                  ("{:+.3f}".format(delta) if np.isfinite(delta) else "NA"))
+        elif metric == "sample_pct":
+            base_text = _fmt_pct(base)
+            latest_text = _fmt_pct(latest)
+            delta_text = ("{:+.1f} pp".format(delta * 100.0) if np.isfinite(delta) else "NA")
+        else:
+            base_text = _fmt_pct(base)
+            latest_text = _fmt_pct(latest)
+            delta_text = ("{:+.1f} pp".format(delta * 100.0) if np.isfinite(delta) else "NA")
+        rows.append([short_labels[b], base_text, latest_text, delta_text,
+                     _fmt_n(latest_n) + ("*" if low else "")])
+        missing_flags.append(bool(is_missing[b]))
+        low_flags.append(bool(low))
+    metric_title = {
+        "woe": "Train-period median vs latest value",
+        "sample_pct": "Train-period median vs latest share",
+        "bin_bad_rate": "Train-period median vs latest bad rate",
+    }.get(metric, "Period summary")
+    _draw_compact_table(
+        ax, rows, ["Bin", "Train med.", "Latest", "Change", "Latest n"],
+        missing_flags=missing_flags, low_flags=low_flags,
+        fontsize=6.8, title=metric_title)
+    ax.text(0.01, 0.015, "* = latest period has low sample / unreliable estimate",
+            transform=ax.transAxes, fontsize=6.2, color="#666666", va="bottom")
+
+
+def _plot_share_heatmap(ax, matrices, periods, period_context, short_labels):
+    values = np.asarray(matrices["sample_pct"], dtype=float).T * 100.0
+    masked = np.ma.masked_invalid(values)
+    finite = values[np.isfinite(values)]
+    vmax = max(float(np.nanpercentile(finite, 95)) if len(finite) else 10.0, 10.0)
+    image = ax.imshow(masked, aspect="auto", interpolation="nearest",
+                      cmap="Blues", vmin=0, vmax=vmax)
+    ax.set_title("Period sample share by bin | heatmap", fontsize=_FS_PANEL_TITLE,
+                 loc="left", pad=7)
+    ax.set_yticks(np.arange(len(short_labels)))
+    ax.set_yticklabels(short_labels, fontsize=_FS_TICK)
+    positions = _period_tick_positions(len(periods), 14)
+    ax.set_xticks(positions)
+    labels = []
+    for index in positions:
+        label = _compact_period_label(periods.loc[index, "period_label"])
+        if periods.loc[index, "split"] == "跨界":
+            label += "*"
+        labels.append(label)
+    ax.set_xticklabels(labels, rotation=0, ha="center", fontsize=6.5)
+    ax.tick_params(axis="x", pad=3)
+    ax.set_xlabel("Time period", fontsize=_FS_AXIS_LABEL)
+    ax.set_xlim(-0.5, len(periods) - 0.5)
+    _draw_period_overlay(ax, periods, period_context["first_oot"])
+    ax.grid(False)
+    colorbar = ax.figure.colorbar(image, ax=ax, fraction=0.035, pad=0.025)
+    colorbar.set_label("Sample share (%)", fontsize=_FS_NOTE)
+    colorbar.ax.tick_params(labelsize=6.5)
+
+
+def _plot_psi_table(ax, matrices, periods, short_labels, max_psi,
+                    min_period_n, max_rows=8):
+    rows, low_flags = [], []
+    start = max(0, len(periods) - max_rows)
+    for i in range(start, len(periods)):
+        low = bool(matrices["low_period"][i])
+        psi_value = matrices["period_psi"][i]
+        contributions = matrices["psi_contrib"][i]
+        if np.isfinite(contributions).any():
+            top_idx = int(np.nanargmax(contributions))
+            top_bin = short_labels[top_idx]
+            top_value = contributions[top_idx]
+        else:
+            top_bin, top_value = "NA", np.nan
+        if low:
+            status = "Low n"
+        elif np.isfinite(psi_value) and psi_value > max_psi:
+            status = "Above threshold"
+        else:
+            status = "OK" if np.isfinite(psi_value) else "NA"
+        rows.append([
+            str(periods.loc[i, "period_label"]),
+            _fmt_n(matrices["total_n"][i]), _fmt_float(psi_value, 3),
+            top_bin, _fmt_float(top_value, 4), status,
+        ])
+        low_flags.append(low)
+    _draw_compact_table(
+        ax, rows, ["Period", "N", "PSI", "Top bin", "Contribution", "Status"],
+        low_flags=low_flags, fontsize=6.5,
+        title="PSI detail (latest periods)")
 
 
 def _trend_legend_handles(oot_enabled, has_low_sample, has_single_class,
@@ -1730,7 +1963,7 @@ def _plot_time_trend(axes, periods, matrices, info, period_context,
     positions = _period_tick_positions(n_periods, 12)
     ax_iv.set_xticks(x[positions])
     ax_iv.set_xticklabels([tick_labels[index] for index in positions],
-                          rotation=45, ha="right", fontsize=_FS_TICK)
+                          rotation=0, ha="center", fontsize=6.8)
     ax_iv.tick_params(axis="x", pad=6)
     for axis in axes[:-1]:
         axis.set_xticks([])
@@ -1745,23 +1978,19 @@ def _draw_bin_legend(ax, short_labels, is_missing):
     for index, label in enumerate(short_labels):
         handles.append(Line2D(
             [0], [0], color=_bin_color(index, bool(is_missing[index])),
-            lw=1.8, marker="o", markersize=4))
+            lw=1.8, marker="o", markersize=3.5))
         labels.append(label)
-    handles.append(Line2D(
-        [0], [0], color="#444444", lw=0, marker="o", markersize=5,
-        markerfacecolor="white"))
-    labels.append("Low sample")
-    handles.append(Line2D([0], [0], color="#333333", lw=1.2, ls="--"))
-    labels.append("OOT split")
-    handles.append(Patch(facecolor="#9E9E9E", alpha=0.30, edgecolor="none"))
-    labels.append("Crossing period")
+    handles.extend([
+        Line2D([], [], color="#444444", lw=0, marker="o", markersize=4,
+               markerfacecolor="white"),
+        Line2D([0], [0], color="#333333", lw=1.2, ls="--"),
+        Patch(facecolor="#9E9E9E", alpha=0.30, edgecolor="none"),
+    ])
+    labels.extend(["Low sample", "OOT split", "Crossing period"])
     ax.axis("off")
-    ax.text(0.0, 0.5, "Period lines by bin", fontsize=_FS_PANEL_TITLE,
-            weight="bold", va="center")
-    ax.legend(handles, labels, loc="center left",
-              bbox_to_anchor=(0.13, 0.5), ncol=min(5, len(handles)),
-              frameon=False, fontsize=_FS_LEGEND, handlelength=1.8,
-              columnspacing=1.0, handletextpad=0.5)
+    ax.legend(handles, labels, loc="center", ncol=min(9, len(handles)),
+              frameon=False, fontsize=7.0, handlelength=1.5,
+              columnspacing=1.0, handletextpad=0.4, borderaxespad=0.0)
 
 
 def _plot_period_lines(ax, matrices, periods, period_context, short_labels,
@@ -1808,12 +2037,12 @@ def _plot_period_lines(ax, matrices, periods, period_context, short_labels,
     if show_xlabels:
         labels = []
         for index in range(n_periods):
-            label = str(periods.loc[index, "period_label"])
+            label = _compact_period_label(periods.loc[index, "period_label"])
             if periods.loc[index, "split"] == "跨界":
                 label += "*"
             labels.append(label)
         ax.set_xticklabels([labels[index] for index in positions],
-                           rotation=45, ha="right", fontsize=_FS_TICK)
+                           rotation=0, ha="center", fontsize=6.5)
     else:
         ax.set_xticklabels([])
     ax.tick_params(axis="x", pad=5)
@@ -1901,9 +2130,10 @@ def _plot_psi_panel(ax, ordered, matrices, periods, period_context,
                     arrowprops=dict(arrowstyle="-|>",
                                     color=_THRESHOLD_COLOR, lw=0.6))
     positions = _period_tick_positions(n_periods, 14)
-    labels = [str(periods.loc[index, "period_label"]) for index in positions]
+    labels = [_compact_period_label(periods.loc[index, "period_label"])
+              for index in positions]
     ax.set_xticks(x[positions])
-    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=_FS_TICK)
+    ax.set_xticklabels(labels, rotation=0, ha="center", fontsize=6.8)
     ax.tick_params(axis="x", pad=5)
     _draw_period_overlay(ax, periods, period_context["first_oot"])
     ax.set_ylabel("PSI", fontsize=_FS_AXIS_LABEL)
@@ -1970,10 +2200,18 @@ def _feature_plot_limits(analysis, max_psi):
     return {"samples": samples, "bad_rate": bad_rate, "iv": iv, "psi": psi}
 
 
+def _compact_period_label(value):
+    """图中日期标签用 MM-DD；月份标签保留 YYYY-MM，减少横轴拥挤。"""
+    value = str(value)
+    if len(value) >= 10 and value[4:5] == "-" and value[7:8] == "-":
+        return value[5:10]
+    return value
+
+
 def _period_tick_labels(periods, matrices):
     labels = []
     for index in range(len(periods)):
-        label = str(periods.loc[index, "period_label"])
+        label = _compact_period_label(periods.loc[index, "period_label"])
         coverage = matrices["coverage"][index]
         if np.isfinite(coverage) and coverage < 0.999:
             label += " (cov {:.0%})".format(coverage)
@@ -2051,131 +2289,159 @@ def _draw_figure_header(fig, analysis, info, params):
 
 
 def _layout_feature_figure(fig, header_bottom):
-    # 显式间隔行代替统一 hspace：日期标签、图例和说明文字需要的留白不同。
+    """紧凑布局：核心图表右侧配套明细表，时间样本占比改为热力图。"""
     rows = [
-        ("overall", 6.40), ("spacer", 0.35), ("trend_legend", 0.35),
-        ("trend", 2.60), ("spacer", 1.15),
-        ("bin_legend", 0.55), ("spacer", 0.20),
-        ("woe_lines", 2.20), ("spacer", 0.85),
-        ("share_lines", 2.20), ("spacer", 0.85),
-        ("bad_rate_lines", 2.20), ("spacer", 1.25),
-        ("psi_legend", 0.35), ("psi", 2.10), ("spacer", 0.60),
-        ("reason", 0.80),
+        ("overall_share", 3.00), ("spacer", 0.34),
+        ("overall_woe", 2.75), ("spacer", 0.34),
+        ("overall_iv", 2.75), ("spacer", 0.20),
+        ("trend_legend", 0.36), ("trend", 4.00), ("spacer", 0.52),
+        ("bin_legend", 0.55), ("spacer", 0.18),
+        ("woe_lines", 2.80), ("spacer", 0.28),
+        ("share_lines", 2.80), ("spacer", 0.48),
+        ("bad_rate_lines", 2.80), ("spacer", 0.52),
+        ("psi_legend", 0.36), ("psi", 3.10), ("spacer", 0.48),
+        ("reason", 0.75),
     ]
     heights = [row[1] for row in rows]
     grid = fig.add_gridspec(
-        len(rows), 6, height_ratios=heights,
-        hspace=0.0, wspace=0.36, left=0.055, right=0.965,
-        top=header_bottom, bottom=0.025)
+        len(rows), 12, height_ratios=heights, hspace=0.04, wspace=0.30,
+        left=0.045, right=0.98, top=header_bottom, bottom=0.025)
     axes = {}
     for index, (name, _) in enumerate(rows):
-        if name == "overall":
-            overall_wrap = grid[index, :].subgridspec(
-                2, 1, height_ratios=[5.6, 0.35], hspace=0.12)
-            overall_grid = overall_wrap[0].subgridspec(1, 3, wspace=0.38)
-            left_grid = overall_grid[0].subgridspec(
-                3, 1, height_ratios=[4.2, 0.52, 1.25], hspace=0.50)
-            axes["share"] = fig.add_subplot(left_grid[0])
-            axes["share_legend"] = fig.add_subplot(left_grid[1])
-            axes["table"] = fig.add_subplot(left_grid[2])
-            axes["woe"] = fig.add_subplot(overall_grid[1])
-            axes["iv"] = fig.add_subplot(overall_grid[2])
-            axes["overall_legend"] = fig.add_subplot(overall_wrap[1])
+        if name in ("overall_share", "overall_woe", "overall_iv"):
+            pair = grid[index, :].subgridspec(1, 12, wspace=0.28)
+            chart_key = {"overall_share": "share", "overall_woe": "woe",
+                         "overall_iv": "iv"}[name]
+            table_key = {"overall_share": "share_table", "overall_woe": "woe_table",
+                         "overall_iv": "iv_table"}[name]
+            axes[chart_key] = fig.add_subplot(pair[0, :7])
+            axes[table_key] = fig.add_subplot(pair[0, 7:])
         elif name == "trend_legend":
             axes["trend_legend"] = fig.add_subplot(grid[index, :])
         elif name == "trend":
-            trend_grid = grid[index, :].subgridspec(3, 1, hspace=0.14)
-            axes["trend"] = [fig.add_subplot(trend_grid[i])
-                             for i in range(3)]
+            pair = grid[index, :].subgridspec(1, 12, wspace=0.28)
+            left = pair[0, :8].subgridspec(3, 1, hspace=0.18)
+            axes["trend"] = [fig.add_subplot(left[i]) for i in range(3)]
+            axes["trend_table"] = fig.add_subplot(pair[0, 8:])
         elif name == "bin_legend":
             axes["bin_legend"] = fig.add_subplot(grid[index, :])
-        elif name == "woe_lines":
-            axes["woe_lines"] = fig.add_subplot(grid[index, :])
-        elif name == "share_lines":
-            axes["share_lines"] = fig.add_subplot(grid[index, :])
-        elif name == "bad_rate_lines":
-            axes["bad_rate_lines"] = fig.add_subplot(grid[index, :])
+        elif name in ("woe_lines", "share_lines", "bad_rate_lines", "psi"):
+            pair = grid[index, :].subgridspec(1, 12, wspace=0.28)
+            chart_key, table_key = {
+                "woe_lines": ("woe_lines", "woe_time_table"),
+                "share_lines": ("share_lines", "share_time_table"),
+                "bad_rate_lines": ("bad_rate_lines", "bad_rate_table"),
+                "psi": ("psi", "psi_table"),
+            }[name]
+            axes[chart_key] = fig.add_subplot(pair[0, :8])
+            axes[table_key] = fig.add_subplot(pair[0, 8:])
         elif name == "psi_legend":
             axes["psi_legend"] = fig.add_subplot(grid[index, :])
-        elif name == "psi":
-            axes["psi"] = fig.add_subplot(grid[index, :])
         elif name == "reason":
             axes["reason"] = fig.add_subplot(grid[index, :])
     return axes
-
 
 def _render_feature_figure(fig, analysis, info, params, limits,
                            png_path, pdf_path=None):
     overall = analysis["overall"]
     meta = analysis["overall_meta"]
     reason = analysis["reason"]
-    short_labels = [_short_bin_label(row.lower, row.upper,
-                                     bool(row.is_missing))
-                    for row in overall.itertuples()]
+    full_labels = [_short_bin_label(row.lower, row.upper,
+                                    bool(row.is_missing))
+                   for row in overall.itertuples()]
+    plot_labels = ["Missing" if bool(row.is_missing) else "B{}".format(int(row.bin_order))
+                   for row in overall.itertuples()]
+    table_labels = ["Missing" if bool(row.is_missing) else
+                    "B{} {}".format(int(row.bin_order), label)
+                    for row, label in zip(overall.itertuples(), full_labels)]
     period_context = analysis["period_context"]
     periods = period_context["periods"].reset_index(drop=True)
     matrices = analysis["matrices"]
     tick_labels = _period_tick_labels(periods, matrices)
     header_bottom = _draw_figure_header(fig, analysis, info, params)
     axes = _layout_feature_figure(fig, header_bottom)
+    min_bin_n = params["plot_min_bin_n"]
+    min_period_n = params["plot_min_period_n"]
 
     handles, labels = _plot_share_panel(
-        axes["share"], axes["table"], overall, meta, info,
-        short_labels, params["plot_min_bin_n"])
-    axes["share_legend"].axis("off")
-    axes["share_legend"].legend(
-        handles, labels, loc="center", ncol=3, frameon=False,
-        fontsize=_FS_LEGEND, handlelength=1.5,
-        columnspacing=1.0, handletextpad=0.5)
-    _plot_woe_panel(axes["woe"], overall, meta, short_labels,
-                    params["plot_min_bin_n"])
-    _plot_iv_panel(axes["iv"], overall, meta, info, short_labels,
-                   params["plot_min_bin_n"], params["plot_iv_floor"])
-    axes["overall_legend"].axis("off")
-    axes["overall_legend"].text(
-        0.5, 0.5,
-        "WOE / IV panels: blue = train, orange = OOT; grey hatch = "
-        "missing bin; red edge = low sample; bars = contribution.",
-        ha="center", va="center", fontsize=_FS_NOTE, color="#555555")
+        axes["share"], axes["share_table"], overall, meta, info,
+        plot_labels, min_bin_n, table_labels=plot_labels,
+        range_labels=full_labels)
+    axes["share"].legend(handles, labels, loc="upper right", ncol=2,
+                         frameon=True, framealpha=0.90, fontsize=6.6,
+                         handlelength=1.35, columnspacing=0.7,
+                         handletextpad=0.35, borderpad=0.3)
+
+    woe_handles, woe_labels = _plot_woe_panel(
+        axes["woe"], overall, meta, plot_labels, min_bin_n)
+    axes["woe"].legend(woe_handles, woe_labels, loc="upper right", ncol=2,
+                        frameon=True, framealpha=0.90, fontsize=6.8,
+                        handlelength=1.35, columnspacing=0.7,
+                        handletextpad=0.35, borderpad=0.3)
+    _plot_woe_table(axes["woe_table"], overall, meta, plot_labels,
+                    min_bin_n, table_labels=plot_labels,
+                    range_labels=full_labels)
+
+    iv_handles, iv_labels = _plot_iv_panel(
+        axes["iv"], overall, meta, info, plot_labels,
+        min_bin_n, params["plot_iv_floor"])
+    axes["iv"].legend(iv_handles, iv_labels, loc="upper right", ncol=2,
+                       frameon=True, framealpha=0.90, fontsize=6.8,
+                       handlelength=1.35, columnspacing=0.7,
+                       handletextpad=0.35, borderpad=0.3)
+    _plot_iv_table(axes["iv_table"], overall, meta, plot_labels, info,
+                   min_bin_n, table_labels=plot_labels,
+                   range_labels=full_labels)
 
     trend_info = dict(info)
     trend_info["_train_bad_rate"] = meta["train_bad_rate"]
     _plot_time_trend(axes["trend"], periods, matrices, trend_info,
-                     period_context, params["plot_min_period_n"],
-                     tick_labels, limits)
+                     period_context, min_period_n, tick_labels, limits)
     trend_handles = _trend_legend_handles(
         period_context["first_oot"] is not None,
-        bool((matrices["total_n"] < params["plot_min_period_n"]).any()),
+        bool((matrices["total_n"] < min_period_n).any()),
         bool((~periods["both_classes"].to_numpy(dtype=bool)).any()),
         bool((~np.isfinite(matrices["period_iv"])).any()))
     axes["trend_legend"].axis("off")
     axes["trend_legend"].text(
-        0.0, 0.5, "Period trend (fixed train bins): samples / bad rate / IV",
+        0.0, 0.5, "Period trend: sample volume / bad rate / IV",
         fontsize=_FS_PANEL_TITLE, weight="bold", va="center")
     axes["trend_legend"].legend(
         handles=trend_handles, loc="center right",
         ncol=5 if len(trend_handles) > 6 else 3, frameon=False,
-        fontsize=_FS_LEGEND, handlelength=1.6,
-        columnspacing=0.9, handletextpad=0.5)
+        fontsize=6.8, handlelength=1.4,
+        columnspacing=0.7, handletextpad=0.4)
+    _plot_period_summary_table(
+        axes["trend_table"], periods, matrices, min_period_n, max_rows=8)
 
     is_missing = overall["is_missing"].to_numpy(dtype=bool)
-    _draw_bin_legend(axes["bin_legend"], short_labels, is_missing)
+    _draw_bin_legend(axes["bin_legend"], plot_labels, is_missing)
     _plot_period_lines(
-        axes["woe_lines"], matrices, periods, period_context, short_labels,
+        axes["woe_lines"], matrices, periods, period_context, plot_labels,
         is_missing, "woe", "WOE",
         "Period WOE by bin (positive = lower risk)",
         zero_line=True, show_xlabels=False)
-    _plot_period_lines(
-        axes["share_lines"], matrices, periods, period_context, short_labels,
-        is_missing, "sample_pct", "Sample share",
-        "Period sample share by bin", percent=True, show_xlabels=False)
+    _plot_bin_time_table(
+        axes["woe_time_table"], matrices, periods, plot_labels, "woe",
+        min_bin_n, min_period_n)
+
+    _plot_share_heatmap(
+        axes["share_lines"], matrices, periods, period_context, plot_labels)
+    _plot_bin_time_table(
+        axes["share_time_table"], matrices, periods, plot_labels, "sample_pct",
+        min_bin_n, min_period_n)
+
     _plot_period_lines(
         axes["bad_rate_lines"], matrices, periods, period_context,
-        short_labels, is_missing, "bin_bad_rate", "Bad rate",
+        plot_labels, is_missing, "bin_bad_rate", "Bad rate",
         "Period bad rate by bin", percent=True, show_xlabels=True)
+    _plot_bin_time_table(
+        axes["bad_rate_table"], matrices, periods, plot_labels, "bin_bad_rate",
+        min_bin_n, min_period_n)
+
     psi_handles, psi_labels = _plot_psi_panel(
         axes["psi"], overall, matrices, periods, period_context,
-        short_labels, params["max_psi"], ylim=limits["psi"])
+        plot_labels, params["max_psi"], ylim=limits["psi"])
     axes["psi_legend"].axis("off")
     axes["psi_legend"].text(
         0.0, 0.5, "Period PSI and bin contributions (vs train)",
@@ -2183,8 +2449,11 @@ def _render_feature_figure(fig, analysis, info, params, limits,
     axes["psi_legend"].legend(
         psi_handles, psi_labels, loc="center right",
         ncol=min(5, max(2, len(psi_handles))), frameon=False,
-        fontsize=_FS_LEGEND, handlelength=1.6,
-        columnspacing=0.9, handletextpad=0.5)
+        fontsize=6.8, handlelength=1.4,
+        columnspacing=0.7, handletextpad=0.4)
+    _plot_psi_table(
+        axes["psi_table"], matrices, periods, plot_labels,
+        params["max_psi"], min_period_n, max_rows=8)
 
     axes["reason"].axis("off")
     reason_text = _wrap_text_for_axes(
@@ -2199,9 +2468,8 @@ def _render_feature_figure(fig, analysis, info, params, limits,
         fig.savefig(str(pdf_path), format="pdf",
                     bbox_inches="tight", facecolor="white")
 
-
 def _feature_figure_size():
-    return (17, 27)
+    return (18, 29)
 
 
 def _render_feature_plot(analysis, info, params, plt, plots_dir, file_stem):
