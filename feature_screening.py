@@ -18,9 +18,12 @@ OOT 稳定且缺失贡献不超限筛选；入选后再按 WOE 相关性贪心�
 坏账率/WOE/IV 贡献、OOT 对照、分期趋势、WOE 热力图、分期占比与 PSI
 来源，并在图底部标注纳入候选的原因。绘图只读取现有结果，不修改
 selected、reason、候选清单或分箱边界。绘图依赖 matplotlib。
+
+结果按样本表文件名、变量表文件名和标签归档到
+{根目录}/feature_screening_reports/{样本文件名}_{变量表文件名}_{标签名}/，
+同一组合重复运行会覆盖同名文件；分析图按特征名命名。
 """
 from pathlib import Path
-from datetime import datetime
 from collections import Counter
 import textwrap
 import re
@@ -1701,22 +1704,43 @@ def _setup_matplotlib():
 
 
 def generate_feature_analysis_plots(data, train, oot, target, summary,
-                                    bin_detail, oot_mask, output_root,
+                                    bin_detail, oot_mask, run_dir,
                                     params):
-    """对去重后的最终候选特征批量生成分析图、图片索引和分期明细。"""
+    """在指定结果目录生成分析图、图片索引和分期明细。"""
     selected = summary.loc[summary["selected"], "feature"].tolist()
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = (Path(output_root)
-               / "analysis_{}_{}".format(_safe_filename(target), timestamp))
+    run_dir = Path(run_dir)
     plots_dir = run_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
     index_path = run_dir / "image_index.csv"
     time_path = run_dir / "time_bin_detail.csv"
     empty_index = pd.DataFrame(columns=_INDEX_COLUMNS)
     empty_time = pd.DataFrame(columns=_TIME_COLUMNS)
+    previous_plots = set()
+    if index_path.exists():
+        try:
+            old_index = pd.read_csv(index_path, dtype=str)
+        except Exception:
+            old_index = pd.DataFrame()
+        for column in ("plot_png", "plot_pdf"):
+            if column not in old_index:
+                continue
+            for value in old_index[column].dropna():
+                path = Path(str(value))
+                if (path.is_file()
+                        and plots_dir.resolve() in path.resolve().parents):
+                    previous_plots.add(path.resolve())
+
+    def remove_plots(paths):
+        for path in paths:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
     if not selected:
         empty_index.to_csv(index_path, index=False, encoding="utf-8-sig")
         empty_time.to_csv(time_path, index=False, encoding="utf-8-sig")
+        remove_plots(previous_plots)
         print("最终候选为空，未生成分析图；空结果目录：{}".format(run_dir))
         return {"run_dir": run_dir, "success": 0, "failed": 0,
                 "index": empty_index, "time_detail": empty_time}
@@ -1759,7 +1783,8 @@ def generate_feature_analysis_plots(data, train, oot, target, summary,
     failures = []
     for position, feature in enumerate(selected, 1):
         export_name = export_names[feature]
-        file_stem = "{:04d}_{}".format(position, _safe_filename(export_name))
+        file_stem = _safe_filename(
+            feature if export_name in collision_groups else export_name)
         png_path = plots_dir / (file_stem + ".png")
         pdf_path = plots_dir / (file_stem + ".pdf") if params["plot_pdf"] else None
         info = info_map.get(feature, {})
@@ -1817,6 +1842,14 @@ def generate_feature_analysis_plots(data, train, oot, target, summary,
                   if time_rows else empty_time)
     index_frame.to_csv(index_path, index=False, encoding="utf-8-sig")
     time_frame.to_csv(time_path, index=False, encoding="utf-8-sig")
+    current_plots = set()
+    for row in index_rows:
+        if row["plot_status"] != "成功":
+            continue
+        for column in ("plot_png", "plot_pdf"):
+            if row[column]:
+                current_plots.add(Path(row[column]).resolve())
+    remove_plots(previous_plots - current_plots)
     success = int((index_frame["plot_status"] == "成功").sum())
     failed = len(index_frame) - success
     if failures:
@@ -1863,6 +1896,10 @@ def run_feature_screening(root_dir, min_iv=0.02, n_bins=5,
         None 表示不去重。
     min_iv 是 IV 阈值（有 OOT 时取训练与 OOT 的较小值）；
     n_bins/n_prebins/min_bin_pct 控制分箱。
+
+    结果写入
+    {根目录}/feature_screening_reports/{样本文件名}_{变量表文件名}_{标签名}/，
+    文件名不含日期；同一组合重复运行覆盖同名文件，分析图按特征名命名。
 
     分析绘图（去重完成后仅对最终候选特征执行，不改变筛选结果）：
     plot_results: 是否生成分析图、候选原因和明细；默认开启。
@@ -2064,14 +2101,17 @@ def run_feature_screening(root_dir, min_iv=0.02, n_bins=5,
     candidates = summary.loc[summary["selected"], ["feature"]].reset_index(drop=True)
     candidates["feature"] = candidates["feature"].str.replace("_woe", "", regex=False)
     candidates = candidates.drop_duplicates().reset_index(drop=True)
-    output = root / "feature_screening_reports"
-    output.mkdir(parents=True, exist_ok=True)
-    date = datetime.now().strftime("%Y%m%d")
+    run_name = "{}_{}_{}".format(
+        _safe_filename(Path(sample_file).stem, max_len=40),
+        _safe_filename(Path(variable_file).stem, max_len=40),
+        _safe_filename(target, max_len=40))
+    run_dir = (root / "feature_screening_reports" / run_name)
+    run_dir.mkdir(parents=True, exist_ok=True)
     for name, frame in [("特征筛选结果", summary), ("特征分箱结果", bin_detail),
                         ("候选变量清单", candidates)]:
-        frame.to_csv(output / "{}_{}_{}.csv".format(name, target, date),
+        frame.to_csv(run_dir / "{}_{}.csv".format(run_name, name),
                      index=False, encoding="utf-8-sig")
-    print("入选特征：{}；结果目录：{}".format(len(candidates), output))
+    print("入选特征：{}；结果目录：{}".format(len(candidates), run_dir))
     if plot_results:
         analysis_params = {
             "target": target,
@@ -2090,7 +2130,7 @@ def run_feature_screening(root_dir, min_iv=0.02, n_bins=5,
         }
         LAST_ANALYSIS = generate_feature_analysis_plots(
             data, train, oot, target, summary, bin_detail, oot_mask,
-            output, analysis_params)
+            run_dir, analysis_params)
     else:
         print("分析绘图已关闭（plot_results=False）。")
     return data, summary, bin_detail, candidates
