@@ -23,11 +23,23 @@ selected、reason、候选清单或分箱边界。绘图依赖 matplotlib。
 结果按样本表文件名、变量表文件名和标签归档到
 {根目录}/feature_screening_reports/{样本文件名}_{变量表文件名}_{标签名}/，
 同一组合重复运行会覆盖同名文件；分析图按特征名命名。
+
+大数据/线上运行：
+- feature_chunk_size: 按变量分块读取和筛选，显著降低峰值内存；None 表示
+  一次性载入全部变量。分块模式返回的 data 只含主键、标签和时间列（绘图时
+  再加上本次绘制的变量列），不包含全部特征。
+- n_jobs: 分箱并行进程数，-1 表示全部 CPU；无 fork 的平台自动退回单进程。
+- dedup_max_features / dedup_sample_rows: WOE 相关性去重的变量数上限和
+  训练样本行数上限；分块模式未指定行数时默认最多 20 万行。
+- plot_max_features: 只绘制 IV 最高的前 N 个候选，None 表示全部。
+- plot_n_jobs: 并行绘图进程数，-1 表示全部 CPU。
 """
 from pathlib import Path
 from collections import Counter
 import textwrap
 import re
+import os
+import time
 import numpy as np
 import pandas as pd
 
@@ -415,6 +427,296 @@ def auto_monotonic_binning(x, y, n_bins=5, n_prebins=20, min_bin_pct=0.05,
         )
         info["is_stable"] = is_stable
     return detail, info
+
+
+def _screen_feature_record(feature, info, min_iv, max_missing_iv_share):
+    """按筛选门槛生成单特征结果行，口径与逐特征主流程一致。"""
+    missing_share_ok = (
+        max_missing_iv_share is None
+        or info["iv_missing_share"] <= max_missing_iv_share + TOL
+    )
+    stable_ok = info["is_stable"] is not False
+    selected = bool(info["iv_min"] >= min_iv and info["is_monotonic"]
+                    and missing_share_ok and stable_ok)
+    if not info["is_monotonic"]:
+        reason = "无法判断单调性（全缺失）"
+    elif not missing_share_ok:
+        reason = "缺失箱 IV 占比过高"
+    elif info["iv_min"] < min_iv:
+        reason = "IV 低于阈值"
+    elif not stable_ok:
+        reason = "OOT 不稳定"
+    else:
+        reason = "入选"
+    return dict(feature=feature, selected=selected, reason=reason, **info)
+
+
+def _screen_one_feature(feature, train_x, train_y, oot_x, oot_y, params):
+    grouped, info = auto_monotonic_binning(
+        train_x, train_y, n_bins=params["n_bins"],
+        n_prebins=params["n_prebins"], min_bin_pct=params["min_bin_pct"],
+        x_oot=oot_x, y_oot=oot_y, max_psi=params["max_psi"],
+    )
+    record = _screen_feature_record(
+        feature, info, params["min_iv"], params["max_missing_iv_share"])
+    grouped.insert(0, "feature", feature)
+    return record, grouped
+
+
+_SCREEN_WORKER_CONTEXT = None
+
+
+def _screen_feature_worker(feature):
+    ctx = _SCREEN_WORKER_CONTEXT
+    oot = ctx["oot"]
+    return _screen_one_feature(
+        feature, ctx["train"][feature], ctx["train_y"],
+        None if oot is None else oot[feature], ctx["oot_y"], ctx["params"])
+
+
+def _screen_feature_set(features, train, oot, target, params, n_jobs=1,
+                        progress=True):
+    """逐特征分箱筛选；n_jobs>1 时在 POSIX 上用 fork 并行，结果顺序不变。"""
+    if not features:
+        return [], []
+    train_y = train[target]
+    oot_y = None if oot is None else oot[target]
+    workers = int(n_jobs)
+    if workers == -1:
+        workers = os.cpu_count() or 1
+    workers = max(1, min(workers, len(features)))
+    use_pool = workers > 1 and hasattr(os, "fork")
+    rows, details = [], []
+    if not use_pool:
+        for index, feature in enumerate(features, 1):
+            record, grouped = _screen_one_feature(
+                feature, train[feature], train_y,
+                None if oot is None else oot[feature], oot_y, params)
+            rows.append(record)
+            details.append(grouped)
+            if progress and index % 100 == 0:
+                print("已处理：{}/{}".format(index, len(features)))
+        return rows, details
+
+    global _SCREEN_WORKER_CONTEXT
+    import multiprocessing
+    try:
+        context = multiprocessing.get_context("fork")
+    except ValueError:
+        for index, feature in enumerate(features, 1):
+            record, grouped = _screen_one_feature(
+                feature, train[feature], train_y,
+                None if oot is None else oot[feature], oot_y, params)
+            rows.append(record)
+            details.append(grouped)
+        return rows, details
+    _SCREEN_WORKER_CONTEXT = {
+        "train": train, "train_y": train_y, "oot": oot, "oot_y": oot_y,
+        "params": params,
+    }
+    if progress:
+        print("并行分箱：{} 个进程".format(workers))
+    chunksize = max(1, len(features) // (workers * 4))
+    try:
+        with context.Pool(processes=workers) as pool:
+            iterator = pool.imap(
+                _screen_feature_worker, features, chunksize=chunksize)
+            for index, (record, grouped) in enumerate(iterator, 1):
+                rows.append(record)
+                details.append(grouped)
+                if progress and index % 100 == 0:
+                    print("已处理：{}/{}".format(index, len(features)))
+    finally:
+        _SCREEN_WORKER_CONTEXT = None
+    return rows, details
+
+
+def _build_summary_frames(rows, details):
+    summary = pd.DataFrame(rows).sort_values(
+        "iv_min", ascending=False).reset_index(drop=True)
+    summary["dedup_with"] = np.nan
+    bin_detail = pd.concat(details, ignore_index=True)
+    return summary, bin_detail
+
+
+def _dedup_feature_list(selected_features, max_features):
+    features = list(selected_features)
+    if max_features is not None and len(features) > max_features:
+        print("相关性去重只比较 IV 最高的 {} 个变量（共 {} 个），"
+              "其余变量保持入选".format(int(max_features), len(features)))
+        features = features[:int(max_features)]
+    return features
+
+
+def _dedup_train_frame(train, sample_rows):
+    if sample_rows is None or int(sample_rows) >= len(train):
+        return train
+    rng = np.random.RandomState(20240101)
+    positions = np.sort(
+        rng.choice(len(train), size=int(sample_rows), replace=False))
+    print("相关性去重使用 {} / {} 行训练样本".format(len(positions), len(train)))
+    return train.iloc[positions]
+
+
+def _dedup_from_woe(summary, woe_matrix, threshold):
+    """在 WOE 矩阵上做 Spearman 贪心去重，行为与原全量矩阵一致。"""
+    features = list(woe_matrix.columns)
+    corr = woe_matrix.corr(method="spearman").abs()
+    kept, correlated_with = [], {}
+    for feature in features:
+        hits = [k for k in kept if corr.loc[feature, k] >= threshold - TOL]
+        if hits:
+            correlated_with[feature] = hits[0]
+        else:
+            kept.append(feature)
+    if correlated_with:
+        dropped = summary["feature"].isin(correlated_with)
+        summary.loc[dropped, "selected"] = False
+        summary.loc[dropped, "reason"] = "与已选变量高相关"
+        summary["dedup_with"] = summary["feature"].map(correlated_with)
+    return len(features), len(kept)
+
+
+def _apply_dedup(summary, bin_detail, train, threshold, max_features=None,
+                 sample_rows=None):
+    if threshold is None:
+        return
+    selected_features = summary.loc[summary["selected"], "feature"].tolist()
+    if not selected_features:
+        return
+    dedup_features = _dedup_feature_list(selected_features, max_features)
+    dedup_train = _dedup_train_frame(train, sample_rows)
+    detail_groups = {feature: group
+                     for feature, group in bin_detail.groupby("feature")}
+    woe_matrix = pd.DataFrame({
+        feature: _assign_woe(dedup_train[feature], detail_groups[feature])
+        for feature in dedup_features
+    })
+    used, kept = _dedup_from_woe(summary, woe_matrix, threshold)
+    print("相关性去重：参与 {} 个 -> 保留 {} 个（阈值 {:g}）".format(
+        used, kept, threshold))
+
+
+def _resolve_plot_targets(summary, manual_features, plot_max_features,
+                          verbose=True):
+    if manual_features:
+        return list(manual_features)
+    targets = summary.loc[summary["selected"], "feature"].tolist()
+    if plot_max_features is not None and len(targets) > plot_max_features:
+        if verbose:
+            print("候选特征 {} 个，按 IV 只绘制前 {} 个（plot_max_features）"
+                  .format(len(targets), int(plot_max_features)))
+        targets = targets[:int(plot_max_features)]
+    return targets
+
+
+def _read_variable_columns(path, keys, columns):
+    """只读取主键和指定特征列，避免把整张变量表载入内存。"""
+    usecols = list(keys) + [c for c in columns if c not in keys]
+    return pd.read_csv(
+        path, usecols=usecols, dtype={"user_id": str}, low_memory=False)
+
+
+def _clean_variable_keys(frame, keys, name="变量表"):
+    frame["user_id"] = frame["user_id"].str.strip().replace("", np.nan)
+    frame["sample_datetime"] = pd.to_datetime(
+        frame["sample_datetime"], errors="raise")
+    if frame[keys].isna().any().any():
+        raise ValueError(name + " 存在空主键，请先处理。")
+    if frame.duplicated(keys).any():
+        raise ValueError(name + " 主键重复，请先确认原因，不自动去重。")
+    return frame
+
+
+def _numeric_feature_block(frame, columns, strict):
+    """把一块特征转为数值并清理业务默认值；返回可用列和被跳过的列。"""
+    features, skipped = [], []
+    for col in columns:
+        try:
+            numeric = pd.to_numeric(frame[col], errors="raise")
+        except (ValueError, TypeError) as exc:
+            if strict:
+                raise ValueError("特征 {} 含非数值内容，请检查。".format(col)) from exc
+            skipped.append(col)
+            continue
+        default = -1 if col.startswith("bank_txn_lender") else -999999.99999
+        frame[col] = numeric.replace([default, np.inf, -np.inf], np.nan)
+        features.append(col)
+    return features, skipped
+
+
+def _column_blocks(columns, size):
+    size = max(1, int(size))
+    return [columns[i:i + size] for i in range(0, len(columns), size)]
+
+
+def _load_feature_blocks(path, keys, features, base, chunk_size, strict=False):
+    """按列块读取特征并对齐到 base 的行顺序，避免整表常驻内存。"""
+    if not features:
+        return base.copy()
+    parts = [base.reset_index(drop=True)]
+    for block in _column_blocks(features, chunk_size):
+        frame = _read_variable_columns(path, keys, block)
+        _clean_variable_keys(frame, keys)
+        block_features, _ = _numeric_feature_block(frame, block, strict)
+        if not block_features:
+            continue
+        merged = base[keys].merge(
+            frame[keys + block_features], on=keys, how="left",
+            validate="one_to_one")
+        parts.append(merged[block_features].reset_index(drop=True))
+    return pd.concat(parts, axis=1)
+
+
+def _load_woe_blocks(path, keys, features, detail_groups, base, chunk_size):
+    """按列块读取特征并映射为 WOE，返回与 features 同序的 WOE 矩阵。"""
+    parts = []
+    for block in _column_blocks(features, chunk_size):
+        frame = _read_variable_columns(path, keys, block)
+        _clean_variable_keys(frame, keys)
+        _numeric_feature_block(frame, block, strict=True)
+        merged = base[keys].merge(
+            frame[keys + block], on=keys, how="left", validate="one_to_one")
+        parts.append(pd.DataFrame({
+            feature: _assign_woe(merged[feature], detail_groups[feature])
+            for feature in block
+        }))
+    if not parts:
+        return pd.DataFrame(index=range(len(base)))
+    return pd.concat(parts, axis=1)[list(features)]
+
+
+def _split_train_oot(data, target, oot_start, oot_ratio):
+    """按 sample_datetime 切分训练/OOT，返回 train、oot、掩码和说明。"""
+    train, oot, split_note = data, None, None
+    oot_mask = None
+    if oot_start is not None:
+        cutoff = pd.Timestamp(oot_start)
+        oot_mask = (data["sample_datetime"] >= cutoff).to_numpy()
+        if oot_mask.all() or not oot_mask.any():
+            raise ValueError("oot_start 切分后训练集或 OOT 为空，请调整 oot_start。")
+        split_note = "时间切点 {}".format(cutoff)
+    elif oot_ratio is not None:
+        if data["sample_datetime"].nunique() < 2:
+            raise ValueError(
+                "sample_datetime 只有一个取值，无法按时间切分；"
+                "请提供跨多个时间点的样本，或设置 oot_ratio=None。")
+        oot_mask = _time_oot_mask(data["sample_datetime"], oot_ratio)
+        split_note = "时间切点 {}".format(data.loc[oot_mask, "sample_datetime"].min())
+    if oot_mask is not None:
+        train, oot = data.loc[~oot_mask], data.loc[oot_mask]
+        for name, part in [("训练集", train), ("OOT", oot)]:
+            bad_n = int(part[target].sum())
+            if part[target].nunique() != 2:
+                raise ValueError("{} 必须同时包含标签 0 和 1（0: {:,}，1: {:,}），"
+                                 "请调整 oot_start/oot_ratio。".format(
+                                     name, int(len(part) - bad_n), bad_n))
+            if bad_n < 50:
+                print("警告：{} 仅 {:,} 个坏样本，IV/PSI 估计会不稳定。".format(name, bad_n))
+        print("OOT 切分：{}；训练集：{:,}（逾期率 {:.2%}）；OOT：{:,}（逾期率 {:.2%}）".format(
+            split_note, len(train), train[target].mean(),
+            len(oot), oot[target].mean()))
+    return train, oot, oot_mask, split_note
 
 
 def _derive_obs_column(target, columns):
@@ -849,7 +1151,6 @@ def _prepare_feature_analysis(feature, export_name, detail, info, data,
         "overall": overall, "overall_meta": overall_meta,
         "matrices": matrices, "time_long": time_long,
         "reason": reason, "period_context": period_context,
-        "train": train, "oot": oot,
     }
 
 
@@ -1801,21 +2102,36 @@ def _page_note(analysis, spec, max_periods):
                 _fmt_n(n_periods), first_label, last_label))
 
 
+def _build_date_meta(train, oot):
+    """提取训练/OOT 时间范围，供图头和进程池任务复用。"""
+    def bounds(frame):
+        if frame is None or frame.empty:
+            return "", ""
+        values = frame["sample_datetime"]
+        return (values.min().strftime("%Y-%m-%d"),
+                values.max().strftime("%Y-%m-%d"))
+    train_start, train_end = bounds(train)
+    oot_start, oot_end = bounds(oot)
+    return {
+        "train_start": train_start, "train_end": train_end,
+        "oot_start": oot_start, "oot_end": oot_end,
+    }
+
+
 def _draw_figure_header(fig, analysis, info, params, page_note=None):
     meta = analysis["overall_meta"]
     reason = analysis["reason"]
     feature = analysis["feature"]
     export_name = analysis["export_name"]
+    date_meta = analysis["date_meta"]
     title = "Feature analysis: {}".format(feature)
     if export_name != feature:
         title += " (export name: {})".format(export_name)
     train_text = "{} ~ {}".format(
-        analysis["train"]["sample_datetime"].min().strftime("%Y-%m-%d"),
-        analysis["train"]["sample_datetime"].max().strftime("%Y-%m-%d"))
+        date_meta["train_start"], date_meta["train_end"])
     if meta["oot_enabled"]:
         oot_text = "{} ~ {} (n={}, bad rate {})".format(
-            analysis["oot"]["sample_datetime"].min().strftime("%Y-%m-%d"),
-            analysis["oot"]["sample_datetime"].max().strftime("%Y-%m-%d"),
+            date_meta["oot_start"], date_meta["oot_end"],
             _fmt_n(meta["oot_total"]),
             _fmt_pct(meta["oot_bad_rate"], digits=2))
     else:
@@ -2095,13 +2411,45 @@ def _setup_matplotlib():
     return plt
 
 
+def _fallback_page_results(analysis, params, plots_dir, file_stem, error):
+    """渲染进程异常时，为每个预期分页生成一条失败记录。"""
+    try:
+        specs = _feature_page_specs(analysis, params["plot_max_periods"])
+    except Exception:
+        specs = [{"kind": "single", "label": "all"}]
+    results = []
+    for spec in specs:
+        suffix = "" if spec["kind"] == "single" else "_" + spec["label"]
+        png_path = plots_dir / (file_stem + suffix + ".png")
+        pdf_path = (plots_dir / (file_stem + suffix + ".pdf")
+                    if params["plot_pdf"] else None)
+        results.append({
+            "page": spec["label"], "png": png_path, "pdf": pdf_path,
+            "status": "失败", "error": error,
+        })
+    return results
+
+
+def _render_feature_task(payload):
+    """进程池任务：只接收单个特征的小结果，不复制原始宽表。"""
+    analysis, info, params, plots_dir, file_stem = payload
+    try:
+        plt = _setup_matplotlib()
+    except Exception as exc:
+        return _fallback_page_results(
+            analysis, params, plots_dir, file_stem,
+            "{}: {}".format(type(exc).__name__, exc))
+    return _render_feature_pages(
+        analysis, info, params, plt, plots_dir, file_stem)
+
+
 def generate_feature_analysis_plots(data, train, oot, target, summary,
                                     bin_detail, oot_mask, run_dir,
                                     params):
     """在指定结果目录生成分析图、图片索引和分期明细。"""
     manual_features = params.get("plot_features") or None
-    plot_targets = (list(manual_features) if manual_features
-                    else summary.loc[summary["selected"], "feature"].tolist())
+    plot_targets = _resolve_plot_targets(
+        summary, manual_features, params.get("plot_max_features"))
     run_dir = Path(run_dir)
     plots_dir = run_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
@@ -2153,6 +2501,7 @@ def generate_feature_analysis_plots(data, train, oot, target, summary,
     period_context = _build_period_context(
         data["sample_datetime"].to_numpy(), labels, oot_array,
         params["time_freq"])
+    date_meta = _build_date_meta(train, oot)
     target_kind = "指定变量" if manual_features else "候选特征"
     print("分析图：{} 个{}；时间粒度 {}；时间段 {} 个；输出 {}"
           .format(len(plot_targets), target_kind, params["time_freq"],
@@ -2185,67 +2534,130 @@ def generate_feature_analysis_plots(data, train, oot, target, summary,
     info_map = summary.set_index("feature").to_dict("index")
     index_rows, time_rows = [], []
     failures = []
+    items = []
     for position, feature in enumerate(plot_targets, 1):
         export_name = export_names[feature]
         file_stem = _safe_filename(
             feature if export_name in collision_groups else export_name)
-        fallback_png = plots_dir / (file_stem + ".png")
-        fallback_pdf = (plots_dir / (file_stem + ".pdf")
-                        if params["plot_pdf"] else None)
-        info = info_map.get(feature, {})
-        reason = None
-        page_results = []
+        item = {
+            "position": position, "feature": feature,
+            "export_name": export_name, "file_stem": file_stem,
+            "fallback_png": plots_dir / (file_stem + ".png"),
+            "fallback_pdf": (plots_dir / (file_stem + ".pdf")
+                             if params["plot_pdf"] else None),
+            "info": info_map.get(feature, {}),
+            "analysis": None, "reason": None, "page_results": None,
+        }
         try:
             detail = detail_groups.get(feature)
             if detail is None:
                 raise ValueError("bin_detail 中缺少该特征的分箱结果")
             analysis = _prepare_feature_analysis(
-                feature, export_name, detail.copy(), info, data, target,
-                train, oot, period_context, params)
-            if manual_features and not bool(info.get("selected", False)):
+                feature, export_name, detail.copy(), item["info"], data,
+                target, train, oot, period_context, params)
+            analysis["date_meta"] = date_meta
+            if manual_features and not bool(item["info"].get("selected", False)):
                 analysis["reason"]["candidate_reason"] = (
                     "Requested by user; screening status: {}.".format(
-                        _screen_reason_en(info.get("reason", ""))))
-            reason = dict(analysis["reason"])
-            page_results = _render_feature_pages(
-                analysis, info, params, plt, plots_dir, file_stem)
+                        _screen_reason_en(item["info"].get("reason", ""))))
+            item["analysis"] = analysis
+            item["reason"] = dict(analysis["reason"])
             time_detail = analysis["time_long"]
             time_detail.insert(0, "export_name", export_name)
             time_detail.insert(0, "feature", feature)
-            time_rows.append(time_detail)
+            item["time_detail"] = time_detail
         except Exception as exc:
             error = "{}: {}".format(type(exc).__name__, exc)
-            page_results = [{
-                "page": "all", "png": fallback_png, "pdf": fallback_pdf,
-                "status": "失败", "error": error,
+            item["reason"] = {
+                "candidate_reason": "Analysis failed: {}".format(error),
+            }
+            item["page_results"] = [{
+                "page": "all", "png": item["fallback_png"],
+                "pdf": item["fallback_pdf"], "status": "失败",
+                "error": error,
             }]
-            if reason is None:
-                reason = {
-                    "candidate_reason": "Analysis failed: {}".format(error),
-                }
+        items.append(item)
+
+    plot_jobs = int(params.get("plot_n_jobs", 1) or 1)
+    if plot_jobs == -1:
+        plot_jobs = os.cpu_count() or 1
+    workers = max(1, min(plot_jobs, len(items)))
+    rendered_serially = False
+    if workers > 1:
+        print("并行绘图：{} 个进程".format(workers))
+        try:
+            from concurrent.futures import ProcessPoolExecutor, as_completed
+            pending = {}
+            with ProcessPoolExecutor(max_workers=workers) as executor:
+                for index, item in enumerate(items):
+                    if item["analysis"] is None:
+                        continue
+                    payload = (item["analysis"], item["info"], params,
+                               plots_dir, item["file_stem"])
+                    pending[executor.submit(
+                        _render_feature_task, payload)] = index
+                for done, future in enumerate(as_completed(pending), 1):
+                    index = pending[future]
+                    item = items[index]
+                    try:
+                        item["page_results"] = future.result()
+                    except Exception as exc:
+                        item["page_results"] = _fallback_page_results(
+                            item["analysis"], params, plots_dir,
+                            item["file_stem"],
+                            "{}: {}".format(type(exc).__name__, exc))
+                    if done % 10 == 0 or done == len(pending):
+                        print("分析绘图：{}/{}".format(done, len(pending)))
+        except Exception as exc:
+            print("并行绘图不可用，改为单进程：{}".format(exc))
+            rendered_serially = True
+    if workers == 1 or rendered_serially:
+        done = 0
+        total_analyses = sum(
+            entry["analysis"] is not None for entry in items)
+        for item in items:
+            if item["analysis"] is None or item["page_results"] is not None:
+                continue
+            try:
+                item["page_results"] = _render_feature_pages(
+                    item["analysis"], item["info"], params, plt, plots_dir,
+                    item["file_stem"])
+            except Exception as exc:
+                item["page_results"] = _fallback_page_results(
+                    item["analysis"], params, plots_dir, item["file_stem"],
+                    "{}: {}".format(type(exc).__name__, exc))
+            done += 1
+            if done % 10 == 0 or done == total_analyses:
+                print("分析绘图：{}/{}".format(done, len(items)))
+
+    for item in items:
+        if item.get("time_detail") is not None:
+            time_rows.append(item["time_detail"])
+        reason = item["reason"] or {"candidate_reason": ""}
+        page_results = item["page_results"] or []
         page_errors = [result["error"] for result in page_results
                        if result["status"] != "成功"]
         if page_errors:
             message = "; ".join(page_errors)
-            failures.append((feature, message))
-            print("警告：特征 {} 绘图失败：{}".format(feature, message))
+            failures.append((item["feature"], message))
+            print("警告：特征 {} 绘图失败：{}".format(
+                item["feature"], message))
         for page_result in page_results:
             pdf_path = page_result["pdf"]
             index_rows.append({
-                "original_feature": feature,
-                "export_name": export_name,
+                "original_feature": item["feature"],
+                "export_name": item["export_name"],
                 "page": page_result["page"],
                 "plot_png": str(page_result["png"]),
                 "plot_pdf": str(pdf_path) if pdf_path is not None else "",
                 "plot_status": page_result["status"],
                 "plot_error": page_result["error"],
                 "candidate_reason": reason["candidate_reason"],
-                "name_collision": export_name in collision_groups,
-                "collision_group": (export_name
-                                    if export_name in collision_groups else ""),
+                "name_collision": item["export_name"] in collision_groups,
+                "collision_group": (item["export_name"]
+                                    if item["export_name"] in collision_groups
+                                    else ""),
             })
-        if position % 10 == 0 or position == len(plot_targets):
-            print("分析绘图：{}/{}".format(position, len(plot_targets)))
     index_frame = pd.DataFrame(index_rows, columns=_INDEX_COLUMNS)
     time_frame = (pd.concat(time_rows, ignore_index=True)
                   if time_rows else empty_time)
@@ -2295,7 +2707,10 @@ def run_feature_screening(root_dir, min_iv=0.02, n_bins=5,
                           time_freq="week",
                           plot_min_bin_n=30, plot_min_bin_good=5,
                           plot_min_bin_bad=5, plot_min_period_n=100,
-                          plot_iv_floor=1e-6):
+                          plot_iv_floor=1e-6,
+                          n_jobs=1, feature_chunk_size=None,
+                          dedup_max_features=None, dedup_sample_rows=None,
+                          plot_max_features=None, plot_n_jobs=1):
     """读取指定的样本表/变量表，按指定标签筛选特征。
 
     返回 data, summary, bin_detail, candidates。
@@ -2332,6 +2747,17 @@ def run_feature_screening(root_dir, min_iv=0.02, n_bins=5,
     plot_min_period_n: 图中标记低样本期间的阈值，默认 100。
     plot_iv_floor: 判断 IV≈0 的下限，默认 1e-6。
     以上阈值只影响图中的斜线标注和 PSI 参考线，不是筛选标准。
+
+    大数据运行参数：
+    feature_chunk_size: 每次读取/筛选的变量列数；None 表示一次性载入。
+        分块模式返回的 data 只含主键、标签、时间列，以及实际绘制时的变量列。
+    n_jobs: 分箱并行进程数，-1 表示全部 CPU；无 fork 的平台自动退回单进程。
+    dedup_max_features: 相关性去重只比较 IV 最高的前 N 个变量；
+        None 表示全部入选变量。
+    dedup_sample_rows: 相关性去重最多使用的训练样本行数（固定随机种子）；
+        None 表示使用全部训练样本，分块模式默认最多 20 万行。
+    plot_max_features: 只绘制 IV 最高的前 N 个候选；None 表示全部。
+    plot_n_jobs: 并行绘图进程数，-1 表示全部 CPU。
     """
     global LAST_ANALYSIS
     LAST_ANALYSIS = None
@@ -2353,6 +2779,23 @@ def run_feature_screening(root_dir, min_iv=0.02, n_bins=5,
     if (not isinstance(plot_max_periods, (int, np.integer))
             or not 4 <= plot_max_periods <= 200):
         raise ValueError("plot_max_periods 必须是 4~200 的整数。")
+    for name, value, allow_none in [
+            ("n_jobs", n_jobs, False),
+            ("plot_n_jobs", plot_n_jobs, False),
+            ("feature_chunk_size", feature_chunk_size, True),
+            ("dedup_max_features", dedup_max_features, True),
+            ("dedup_sample_rows", dedup_sample_rows, True),
+            ("plot_max_features", plot_max_features, True)]:
+        if value is None and allow_none:
+            continue
+        allow_minus_one = name in ("n_jobs", "plot_n_jobs")
+        if (not isinstance(value, (int, np.integer))
+                or value == 0 or (value < 1 and not (allow_minus_one and value == -1))):
+            raise ValueError("{} 必须是正整数{}。".format(
+                name, "或 -1" if allow_minus_one else ""))
+    if n_jobs > 1 and not hasattr(os, "fork"):
+        print("当前平台不支持 fork，分箱改为单进程；绘图仍可设置 plot_n_jobs。")
+        n_jobs = 1
     for name, value in [
             ("plot_min_bin_n", plot_min_bin_n),
             ("plot_min_bin_good", plot_min_bin_good),
@@ -2371,157 +2814,184 @@ def run_feature_screening(root_dir, min_iv=0.02, n_bins=5,
         root / sample_file, dtype={"user_id": str},
         usecols=lambda c: c in keys + [target, obs], low_memory=False,
     )
-    variables = pd.read_csv(
-        root / variable_file, dtype={"user_id": str}, low_memory=False,
-    )
-    for name, frame in [("样本表", samples), ("变量表", variables)]:
-        if not set(keys).issubset(frame.columns):
-            raise ValueError(name + " 缺少主键列。")
-        frame["user_id"] = frame["user_id"].str.strip().replace("", np.nan)
-        frame["sample_datetime"] = pd.to_datetime(frame["sample_datetime"], errors="raise")
-        if frame[keys].isna().any().any():
-            raise ValueError(name + " 存在空主键，请先处理。")
-        if frame.duplicated(keys).any():
-            raise ValueError(name + " 主键重复，请先确认原因，不自动去重。")
+    if not set(keys).issubset(samples.columns):
+        raise ValueError("样本表 缺少主键列。")
+    _clean_variable_keys(samples, keys, "样本表")
+    samples[target] = pd.to_numeric(samples[target], errors="coerce")
+    if obs is not None and obs in samples:
+        samples[obs] = pd.to_numeric(samples[obs], errors="coerce")
+
+    variable_columns = pd.read_csv(root / variable_file, nrows=0).columns
+    if not set(keys).issubset(variable_columns):
+        raise ValueError("变量表 缺少主键列。")
 
     # 变量表可能混入样本表的列（标签、ID 等），一律不作为特征。
-    excluded = [c for c in variables.columns
+    excluded = [c for c in variable_columns
                 if c in sample_columns and c not in keys]
     if excluded:
         print("已排除变量表中与样本表同名的列：{}".format("、".join(excluded)))
     if feature_prefixes is None:
-        candidates = [c for c in variables.columns
+        candidates = [c for c in variable_columns
                       if c not in keys and c not in sample_columns]
         strict = False
     else:
-        candidates = [c for c in variables.columns
+        candidates = [c for c in variable_columns
                       if c.startswith(tuple(feature_prefixes))
                       and c not in sample_columns]
         strict = True
-    features, skipped = [], []
-    for col in candidates:
-        try:
-            numeric = pd.to_numeric(variables[col], errors="raise")
-        except (ValueError, TypeError) as exc:
-            if strict:
-                raise ValueError("特征 {} 含非数值内容，请检查。".format(col)) from exc
-            skipped.append(col)
-            continue
-        default = -1 if col.startswith("bank_txn_lender") else -999999.99999
-        variables[col] = numeric.replace([default, np.inf, -np.inf], np.nan)
-        features.append(col)
-    if skipped:
-        print("已跳过非数值列：{}".format("、".join(skipped)))
-    if not features:
+    if not candidates:
         raise ValueError("变量表没有可用的数值特征列。")
 
-    joined = samples.merge(
-        variables[keys + features], on=keys, how="left",
-        validate="one_to_one", indicator=True,
-    )
-    matched = joined["_merge"].eq("both")
-    joined[target] = pd.to_numeric(joined[target], errors="coerce")
-    eligible = matched & joined[target].isin([0, 1])
-    if obs is not None and obs in joined:
-        eligible &= pd.to_numeric(joined[obs], errors="coerce").eq(1)
-    else:
-        print("未发现成熟标记列，未按成熟度过滤；请确认未成熟标签没有被填成 0。")
-    data = joined.loc[eligible, keys + [target] + features].copy()
-    print("样本数：{:,}；匹配数：{:,}；匹配率：{:.2%}".format(
-        len(samples), int(matched.sum()), matched.mean()))
-    print("分析样本：{:,}；逾期率：{:.2%}；数值特征：{:,}".format(
-        len(data), data[target].mean(), len(features)))
-    if data[target].nunique() != 2:
-        raise ValueError("分析样本必须同时包含标签 0 和 1，请检查匹配及成熟度。")
+    screen_params = {
+        "n_bins": n_bins, "n_prebins": n_prebins,
+        "min_bin_pct": min_bin_pct, "max_psi": max_psi,
+        "min_iv": min_iv,
+        "max_missing_iv_share": max_missing_iv_share,
+    }
 
-    train, oot, split_note = data, None, None
-    oot_mask = None
-    if oot_start is not None:
-        cutoff = pd.Timestamp(oot_start)
-        oot_mask = (data["sample_datetime"] >= cutoff).to_numpy()
-        if oot_mask.all() or not oot_mask.any():
-            raise ValueError("oot_start 切分后训练集或 OOT 为空，请调整 oot_start。")
-        split_note = "时间切点 {}".format(cutoff)
-    elif oot_ratio is not None:
-        if data["sample_datetime"].nunique() < 2:
-            raise ValueError(
-                "sample_datetime 只有一个取值，无法按时间切分；"
-                "请提供跨多个时间点的样本，或设置 oot_ratio=None。")
-        oot_mask = _time_oot_mask(data["sample_datetime"], oot_ratio)
-        split_note = "时间切点 {}".format(data.loc[oot_mask, "sample_datetime"].min())
-    if oot_mask is not None:
-        train, oot = data.loc[~oot_mask], data.loc[oot_mask]
-        for name, part in [("训练集", train), ("OOT", oot)]:
-            bad_n = int(part[target].sum())
-            if part[target].nunique() != 2:
-                raise ValueError("{} 必须同时包含标签 0 和 1（0: {:,}，1: {:,}），"
-                                 "请调整 oot_start/oot_ratio。".format(
-                                     name, int(len(part) - bad_n), bad_n))
-            if bad_n < 50:
-                print("警告：{} 仅 {:,} 个坏样本，IV/PSI 估计会不稳定。".format(name, bad_n))
-        print("OOT 切分：{}；训练集：{:,}（逾期率 {:.2%}）；OOT：{:,}（逾期率 {:.2%}）".format(
-            split_note, len(train), train[target].mean(),
-            len(oot), oot[target].mean()))
+    if feature_chunk_size is None:
+        variables = _read_variable_columns(
+            root / variable_file, keys, candidates)
+        _clean_variable_keys(variables, keys)
+        features, skipped = _numeric_feature_block(
+            variables, candidates, strict)
+        if skipped:
+            print("已跳过非数值列：{}".format("、".join(skipped)))
+        if not features:
+            raise ValueError("变量表没有可用的数值特征列。")
 
-    rows, details = [], []
-    for index, col in enumerate(features, 1):
-        grouped, info = auto_monotonic_binning(
-            train[col], train[target], n_bins=n_bins,
-            n_prebins=n_prebins, min_bin_pct=min_bin_pct,
-            x_oot=None if oot is None else oot[col],
-            y_oot=None if oot is None else oot[target],
-            max_psi=max_psi,
+        joined = samples.merge(
+            variables[keys + features], on=keys, how="left",
+            validate="one_to_one", indicator=True,
         )
-        missing_share_ok = (
-            max_missing_iv_share is None
-            or info["iv_missing_share"] <= max_missing_iv_share + TOL
-        )
-        stable_ok = info["is_stable"] is not False
-        selected = bool(info["iv_min"] >= min_iv and info["is_monotonic"]
-                        and missing_share_ok and stable_ok)
-        if not info["is_monotonic"]:
-            reason = "无法判断单调性（全缺失）"
-        elif not missing_share_ok:
-            reason = "缺失箱 IV 占比过高"
-        elif info["iv_min"] < min_iv:
-            reason = "IV 低于阈值"
-        elif not stable_ok:
-            reason = "OOT 不稳定"
+        matched = joined["_merge"].eq("both")
+        eligible = matched & joined[target].isin([0, 1])
+        if obs is not None and obs in joined:
+            eligible &= joined[obs].eq(1)
         else:
-            reason = "入选"
-        rows.append(dict(feature=col, selected=selected, reason=reason, **info))
-        grouped.insert(0, "feature", col)
-        details.append(grouped)
-        if index % 100 == 0:
-            print("已处理：{}/{}".format(index, len(features)))
+            print("未发现成熟标记列，未按成熟度过滤；请确认未成熟标签没有被填成 0。")
+        data = joined.loc[eligible, keys + [target] + features].copy()
+        print("样本数：{:,}；匹配数：{:,}；匹配率：{:.2%}".format(
+            len(samples), int(matched.sum()), matched.mean()))
+        print("分析样本：{:,}；逾期率：{:.2%}；数值特征：{:,}".format(
+            len(data), data[target].mean(), len(features)))
+        if data[target].nunique() != 2:
+            raise ValueError("分析样本必须同时包含标签 0 和 1，请检查匹配及成熟度。")
+        train, oot, oot_mask, _ = _split_train_oot(
+            data, target, oot_start, oot_ratio)
 
-    summary = pd.DataFrame(rows).sort_values("iv_min", ascending=False).reset_index(drop=True)
-    summary["dedup_with"] = np.nan
-    bin_detail = pd.concat(details, ignore_index=True)
-    if dedup_corr is not None:
-        selected_features = summary.loc[summary["selected"], "feature"].tolist()
-        if selected_features:
-            woe_matrix = pd.DataFrame({
-                feature: _assign_woe(
-                    train[feature],
-                    bin_detail.loc[bin_detail["feature"] == feature])
-                for feature in selected_features
-            })
-            corr = woe_matrix.corr(method="spearman").abs()
-            kept, correlated_with = [], {}
-            for feature in selected_features:
-                hits = [k for k in kept if corr.loc[feature, k] >= dedup_corr - TOL]
-                if hits:
-                    correlated_with[feature] = hits[0]
-                else:
-                    kept.append(feature)
-            if correlated_with:
-                dropped = summary["feature"].isin(correlated_with)
-                summary.loc[dropped, "selected"] = False
-                summary.loc[dropped, "reason"] = "与已选变量高相关"
-                summary["dedup_with"] = summary["feature"].map(correlated_with)
-                print("相关性去重：{} -> {}（阈值 {:g}）".format(
-                    len(selected_features), len(kept), dedup_corr))
+        rows, details = _screen_feature_set(
+            features, train, oot, target, screen_params, n_jobs=n_jobs)
+        summary, bin_detail = _build_summary_frames(rows, details)
+        _apply_dedup(
+            summary, bin_detail, train, dedup_corr,
+            max_features=dedup_max_features, sample_rows=dedup_sample_rows)
+        data_mode = "full"
+        data_return = data
+        plot_data = data
+        train_for_plot, oot_for_plot = train, oot
+    else:
+        blocks = _column_blocks(candidates, feature_chunk_size)
+        first = _read_variable_columns(root / variable_file, keys, blocks[0])
+        _clean_variable_keys(first, keys)
+        probe = samples.merge(
+            first[keys], on=keys, how="left", validate="one_to_one",
+            indicator=True)
+        matched = probe["_merge"].eq("both").to_numpy()
+        eligible = matched & samples[target].isin([0, 1]).to_numpy()
+        if obs is not None and obs in samples:
+            eligible &= samples[obs].eq(1).to_numpy()
+        else:
+            print("未发现成熟标记列，未按成熟度过滤；请确认未成熟标签没有被填成 0。")
+        sample_meta = samples.loc[eligible, keys + [target]].copy()
+        sample_meta[target] = samples.loc[eligible, target].to_numpy()
+        print("样本数：{:,}；匹配数：{:,}；匹配率：{:.2%}".format(
+            len(samples), int(matched.sum()), matched.mean()))
+        print("分析样本：{:,}；逾期率：{:.2%}；数值特征：{:,}".format(
+            len(sample_meta), sample_meta[target].mean(), len(candidates)))
+        if sample_meta[target].nunique() != 2:
+            raise ValueError("分析样本必须同时包含标签 0 和 1，请检查匹配及成熟度。")
+        train_meta, oot_meta, oot_mask, _ = _split_train_oot(
+            sample_meta, target, oot_start, oot_ratio)
+
+        features, skipped = [], []
+        rows, details = [], []
+        for block_index, block in enumerate(blocks):
+            frame = (first if block_index == 0
+                     else _read_variable_columns(
+                         root / variable_file, keys, block))
+            if block_index:
+                _clean_variable_keys(frame, keys)
+            block_features, block_skipped = _numeric_feature_block(
+                frame, block, strict)
+            skipped.extend(block_skipped)
+            if not block_features:
+                continue
+            features.extend(block_features)
+            merged = sample_meta[keys + [target]].merge(
+                frame[keys + block_features], on=keys, how="left",
+                validate="one_to_one")
+            if oot_mask is None:
+                train_block = merged[[target] + block_features]
+                oot_block = None
+            else:
+                train_block = merged.loc[
+                    ~oot_mask, [target] + block_features]
+                oot_block = merged.loc[oot_mask, [target] + block_features]
+            block_rows, block_details = _screen_feature_set(
+                block_features, train_block, oot_block, target,
+                screen_params, n_jobs=n_jobs, progress=False)
+            rows.extend(block_rows)
+            details.extend(block_details)
+            print("分块筛选：{}/{} 列（块大小 {}）".format(
+                len(features), len(candidates), feature_chunk_size))
+        if skipped:
+            print("已跳过非数值列：{}".format("、".join(skipped)))
+        if not features:
+            raise ValueError("变量表没有可用的数值特征列。")
+
+        summary, bin_detail = _build_summary_frames(rows, details)
+        if dedup_corr is not None:
+            selected_features = summary.loc[
+                summary["selected"], "feature"].tolist()
+            if selected_features:
+                dedup_features = _dedup_feature_list(
+                    selected_features, dedup_max_features)
+                effective_rows = dedup_sample_rows
+                if effective_rows is None:
+                    effective_rows = min(len(train_meta), 200000)
+                    print("分块模式默认使用最多 {:,} 行训练样本做相关性去重"
+                          .format(effective_rows))
+                train_positions = (np.arange(len(sample_meta))
+                                   if oot_mask is None
+                                   else np.flatnonzero(~oot_mask))
+                if effective_rows < len(train_positions):
+                    rng = np.random.RandomState(20240101)
+                    picked = np.sort(rng.choice(
+                        len(train_positions), size=int(effective_rows),
+                        replace=False))
+                    train_positions = train_positions[picked]
+                dedup_base = sample_meta.iloc[train_positions][
+                    keys].reset_index(drop=True)
+                detail_groups = {
+                    feature: group for feature, group in
+                    bin_detail.loc[bin_detail["feature"].isin(dedup_features)]
+                    .groupby("feature")}
+                woe_matrix = _load_woe_blocks(
+                    root / variable_file, keys, dedup_features,
+                    detail_groups, dedup_base, feature_chunk_size)
+                used, kept = _dedup_from_woe(
+                    summary, woe_matrix, dedup_corr)
+                print("相关性去重：参与 {} 个 -> 保留 {} 个（阈值 {:g}）".format(
+                    used, kept, dedup_corr))
+        data_mode = "chunk"
+        data_return = sample_meta
+        plot_data = None
+        train_for_plot = (train_meta[[target, "sample_datetime"]]
+                          if oot_mask is not None
+                          else sample_meta[[target, "sample_datetime"]])
+        oot_for_plot = (oot_meta[[target, "sample_datetime"]]
+                        if oot_mask is not None else None)
     candidates = summary.loc[summary["selected"], ["feature"]].reset_index(drop=True)
     candidates["feature"] = candidates["feature"].str.replace("_woe", "", regex=False)
     candidates = candidates.drop_duplicates().reset_index(drop=True)
@@ -2553,6 +3023,13 @@ def run_feature_screening(root_dir, min_iv=0.02, n_bins=5,
                      index=False, encoding="utf-8-sig")
     print("入选特征：{}；结果目录：{}".format(len(candidates), run_dir))
     if plot_results:
+        if data_mode == "chunk":
+            plot_targets = _resolve_plot_targets(
+                summary, plot_features, plot_max_features, verbose=False)
+            plot_data = _load_feature_blocks(
+                root / variable_file, keys, plot_targets,
+                sample_meta, feature_chunk_size, strict)
+            data_return = plot_data
         analysis_params = {
             "target": target,
             "min_iv": float(min_iv),
@@ -2560,6 +3037,8 @@ def run_feature_screening(root_dir, min_iv=0.02, n_bins=5,
             "max_missing_iv_share": max_missing_iv_share,
             "dedup_corr": dedup_corr,
             "plot_features": plot_features,
+            "plot_max_features": plot_max_features,
+            "plot_n_jobs": int(plot_n_jobs),
             "plot_pdf": bool(plot_pdf),
             "plot_dpi": int(plot_dpi),
             "plot_max_periods": int(plot_max_periods),
@@ -2571,11 +3050,11 @@ def run_feature_screening(root_dir, min_iv=0.02, n_bins=5,
             "plot_iv_floor": float(plot_iv_floor),
         }
         LAST_ANALYSIS = generate_feature_analysis_plots(
-            data, train, oot, target, summary, bin_detail, oot_mask,
-            run_dir, analysis_params)
+            plot_data, train_for_plot, oot_for_plot, target, summary,
+            bin_detail, oot_mask, run_dir, analysis_params)
     else:
         print("分析绘图已关闭（plot_results=False）。")
-    return data, summary, bin_detail, candidates
+    return data_return, summary, bin_detail, candidates
 
 
 if __name__ == "__main__":
