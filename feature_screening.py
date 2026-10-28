@@ -760,6 +760,7 @@ def _fmt_pct(value, digits=1):
 
 
 _DIRECTION_EN = {
+    "\u975e\u5355\u8c03": "non-monotonic",
     "递增": "increasing",
     "递减": "decreasing",
     "持平": "flat",
@@ -1368,6 +1369,15 @@ def _profile_legend_handles(oot_enabled):
     return handles
 
 
+def _report_bar_width(ax, count, grouped=False):
+    """Limit bars in physical inches as well as category units."""
+    axis_width = ax.get_position().width * ax.figure.get_figwidth()
+    span = max(count + 0.2, 1.0)
+    cap_inches = 0.30 if grouped else 0.46
+    return min(0.28 if grouped else 0.56,
+               cap_inches * span / max(axis_width, 1.0))
+
+
 def _plot_bin_profile(axes, ordered, meta, x_labels, min_bin_n):
     """整体分箱画像：样本占比、坏账率、WOE、IV 贡献四联图，共享横轴。"""
     share_ax, rate_ax, woe_ax, iv_ax = axes
@@ -1375,8 +1385,8 @@ def _plot_bin_profile(axes, ordered, meta, x_labels, min_bin_n):
     count = len(ordered)
     positions = np.arange(count, dtype=float)
     oot_enabled = bool(meta["oot_enabled"])
-    width = 0.38 if oot_enabled else 0.60
-    offset = width / 2.0 if oot_enabled else 0.0
+    width = _report_bar_width(share_ax, count, grouped=oot_enabled)
+    offset = width * 0.60 if oot_enabled else 0.0
     is_missing = ordered["is_missing"].to_numpy(dtype=bool)
     train_n = ordered["n"].to_numpy(dtype=float)
     oot_n = (ordered["oot_n"].to_numpy(dtype=float) if oot_enabled
@@ -1543,17 +1553,18 @@ def _draw_section_header(ax, title, subtitle=None, handles=None, labels=None,
     ax.axis("off")
     ax.plot([0.0, 1.0], [0.03, 0.03], transform=ax.transAxes,
             color=_AXIS_COLOR, lw=0.8, clip_on=False)
-    title_y = 0.72 if subtitle else 0.55
+    title_y = 0.86 if subtitle else 0.75
     ax.text(0.0, title_y, title, transform=ax.transAxes,
             fontsize=_FS_SECTION, weight="bold", color=_INK, va="center")
     if subtitle:
-        ax.text(0.0, 0.30, subtitle, transform=ax.transAxes,
+        ax.text(0.0, 0.59, subtitle, transform=ax.transAxes,
                 fontsize=_FS_NOTE, color=_INK_SOFT, va="center")
     if handles:
         if labels is None:
             labels = [handle.get_label() for handle in handles]
-        ax.legend(handles, labels, loc="center right",
-                  ncol=ncol or len(handles), frameon=False,
+        ax.legend(handles, labels, loc="lower left",
+                  bbox_to_anchor=(0.0, 0.04),
+                  ncol=ncol or min(len(handles), 8), frameon=False,
                   fontsize=_FS_LEGEND, handlelength=1.4,
                   columnspacing=1.2, handletextpad=0.5,
                   borderaxespad=0.0)
@@ -1968,11 +1979,11 @@ def _plot_time_trend(axes, periods, matrices, info, period_context,
         _style_chart_axis(axis)
         _draw_period_overlay(axis, periods, period_context["first_oot"])
 
-    ax_n.bar(x, periods["n_train"].to_numpy(dtype=float), width=0.82,
+    ax_n.bar(x, periods["n_train"].to_numpy(dtype=float), width=_report_bar_width(ax_n, n_periods),
              color=_TRAIN_COLOR, edgecolor="white", linewidth=0.5,
              label="Train", zorder=2)
     if oot_enabled:
-        ax_n.bar(x, periods["n_oot"].to_numpy(dtype=float), width=0.82,
+        ax_n.bar(x, periods["n_oot"].to_numpy(dtype=float), width=_report_bar_width(ax_n, n_periods),
                  bottom=periods["n_train"].to_numpy(dtype=float),
                  color=_OOT_COLOR, edgecolor="white", linewidth=0.5,
                  label="OOT", zorder=2)
@@ -2024,7 +2035,7 @@ def _plot_time_trend(axes, periods, matrices, info, period_context,
 
     period_iv = matrices["period_iv"]
     ax_iv.bar(x, np.where(np.isfinite(period_iv), period_iv, 0.0),
-              width=0.82, color=_IV_COLOR, edgecolor="white", linewidth=0.5,
+              width=_report_bar_width(ax_iv, n_periods), color=_IV_COLOR, edgecolor="white", linewidth=0.5,
               label="Period IV", zorder=2)
     if np.isfinite(info.get("iv", np.nan)):
         ax_iv.axhline(info["iv"], color=_INK_SOFT, ls="--", lw=1.2,
@@ -2133,6 +2144,7 @@ def _plot_psi_panel(ax, ordered, matrices, periods, period_context,
         values = np.asarray(matrices["psi_contrib"][:, index], dtype=float)
         values = np.where(np.isfinite(values) & ~low_period, values, 0.0)
         ax.bar(x, values, bottom=bottom,
+               width=_report_bar_width(ax, n_periods),
                color=_bin_color(index, bool(is_missing[index])),
                edgecolor="white", linewidth=0.4,
                label=labels[index], zorder=2)
@@ -2509,16 +2521,19 @@ def _draw_report_footer(ax, analysis, info, params):
 
 
 def _layout_single_report_figure(fig, header_bottom):
+    # Explicit space for titles, tick labels and table captions. Zero grid
+    # spacing is intentional: each inter-panel gap has its own height.
     rows = [
-        ("head_profile", 0.38), ("profile", 4.40),
-        ("bin_table", 2.55), ("spacer", 0.12),
-        ("head_trend", 0.38), ("trend", 3.35),
-        ("period_table", 2.35), ("spacer", 0.12),
-        ("head_bins", 0.38), ("heatmap", 2.90), ("psi", 2.50),
-        ("spacer", 0.12),
-        ("head_lines", 0.38), ("woe_lines", 2.50),
-        ("bad_rate_lines", 2.50), ("spacer", 0.10),
-        ("head_drift", 0.36), ("drift_row", 1.85), ("footer", 1.20),
+        ("head_profile", 0.90), ("spacer", 0.30), ("profile", 6.20),
+        ("spacer", 0.60), ("bin_table", 2.80), ("spacer", 0.35),
+        ("head_trend", 0.90), ("spacer", 0.20), ("trend", 4.60),
+        ("spacer", 0.60), ("period_table", 2.80), ("spacer", 0.35),
+        ("head_bins", 0.90), ("spacer", 0.30), ("heatmap", 2.90),
+        ("spacer", 0.85), ("psi", 2.80), ("spacer", 0.65),
+        ("head_lines", 0.90), ("spacer", 0.30), ("woe_lines", 2.80),
+        ("spacer", 0.65), ("bad_rate_lines", 2.80), ("spacer", 0.65),
+        ("head_drift", 0.65), ("drift_row", 2.10),
+        ("spacer", 0.20), ("footer", 1.40),
     ]
     grid = fig.add_gridspec(
         len(rows), 1, height_ratios=[height for _, height in rows],
@@ -2530,12 +2545,12 @@ def _layout_single_report_figure(fig, header_bottom):
             continue
         if name == "profile":
             sub = grid[index, 0].subgridspec(
-                4, 1, hspace=0.16, height_ratios=[1.05, 1.15, 1.0, 1.0])
+                4, 1, hspace=0.48, height_ratios=[1.05, 1.15, 1.0, 1.0])
             axes["profile"] = [
                 fig.add_subplot(sub[row, 0]) for row in range(4)]
         elif name == "trend":
             sub = grid[index, 0].subgridspec(
-                3, 1, hspace=0.14, height_ratios=[1.0, 1.12, 0.95])
+                3, 1, hspace=0.28, height_ratios=[1.0, 1.12, 0.95])
             axes["trend"] = [
                 fig.add_subplot(sub[row, 0]) for row in range(3)]
         else:
@@ -2638,7 +2653,7 @@ def _render_single_report_figure(fig, analysis, info, params, png_path,
 
 
 def _report_figure_size():
-    return (20.0, 33.0)
+    return (18.0, 43.0)
 
 
 def _render_feature_plot(analysis, info, params, plt, plots_dir, file_stem):
