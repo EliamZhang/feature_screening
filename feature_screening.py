@@ -16,7 +16,8 @@ OOT 稳定且缺失贡献不超限筛选；入选后再按 WOE 相关性贪心�
 
 筛选完成后可对最终候选特征批量生成分析图（默认开启）：整体分箱占比/
 坏账率/WOE/IV 贡献、OOT 对照、分期趋势、WOE 热力图、分期占比与 PSI
-来源，并在图底部标注纳入候选的原因。绘图只读取现有结果，不修改
+来源，并在图底部标注纳入候选的原因。也可通过 plot_features 指定变量
+清单，只绘制清单中的变量（不论是否入选）。绘图只读取现有结果，不修改
 selected、reason、候选清单或分箱边界。绘图依赖 matplotlib。
 
 结果按样本表文件名、变量表文件名和标签归档到
@@ -440,6 +441,20 @@ _DIRECTION_EN = {
 
 def _direction_en(value):
     return _DIRECTION_EN.get(str(value), str(value))
+
+
+_SCREEN_REASON_EN = {
+    "入选": "selected",
+    "IV 低于阈值": "IV below threshold",
+    "OOT 不稳定": "OOT unstable",
+    "缺失箱 IV 占比过高": "missing-bin IV share too high",
+    "无法判断单调性（全缺失）": "monotonicity unavailable (all missing)",
+    "与已选变量高相关": "highly correlated with a selected feature",
+}
+
+
+def _screen_reason_en(value):
+    return _SCREEN_REASON_EN.get(str(value), "not selected")
 
 
 def _short_bin_label(lower, upper, is_missing, digits=4):
@@ -1679,7 +1694,9 @@ def generate_feature_analysis_plots(data, train, oot, target, summary,
                                     bin_detail, oot_mask, run_dir,
                                     params):
     """在指定结果目录生成分析图、图片索引和分期明细。"""
-    selected = summary.loc[summary["selected"], "feature"].tolist()
+    manual_features = params.get("plot_features") or None
+    plot_targets = (list(manual_features) if manual_features
+                    else summary.loc[summary["selected"], "feature"].tolist())
     run_dir = Path(run_dir)
     plots_dir = run_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
@@ -1709,18 +1726,18 @@ def generate_feature_analysis_plots(data, train, oot, target, summary,
             except OSError:
                 pass
 
-    if not selected:
+    if not plot_targets:
         empty_index.to_csv(index_path, index=False, encoding="utf-8-sig")
         empty_time.to_csv(time_path, index=False, encoding="utf-8-sig")
         remove_plots(previous_plots)
-        print("最终候选为空，未生成分析图；空结果目录：{}".format(run_dir))
+        print("没有可绘图的变量，未生成分析图；空结果目录：{}".format(run_dir))
         return {"run_dir": run_dir, "success": 0, "failed": 0,
                 "index": empty_index, "time_detail": empty_time}
     try:
         plt = _setup_matplotlib()
     except RuntimeError as exc:
         print("绘图初始化失败：{}；本次仅输出筛选结果。".format(exc))
-        return {"run_dir": run_dir, "success": 0, "failed": len(selected),
+        return {"run_dir": run_dir, "success": 0, "failed": len(plot_targets),
                 "index": empty_index, "time_detail": empty_time}
 
     labels = data[target].to_numpy(dtype=float)
@@ -1731,8 +1748,9 @@ def generate_feature_analysis_plots(data, train, oot, target, summary,
     period_context = _build_period_context(
         data["sample_datetime"].to_numpy(), labels, oot_array,
         params["time_freq"])
-    print("分析图：{} 个候选特征；时间粒度 {}；时间段 {} 个；输出 {}"
-          .format(len(selected), params["time_freq"],
+    target_kind = "指定变量" if manual_features else "候选特征"
+    print("分析图：{} 个{}；时间粒度 {}；时间段 {} 个；输出 {}"
+          .format(len(plot_targets), target_kind, params["time_freq"],
                   period_context["n_periods"], run_dir))
     if period_context["first_oot"] is not None:
         print("  训练/OOT 切点位于第 {} 个时间段（{}）".format(
@@ -1744,7 +1762,7 @@ def generate_feature_analysis_plots(data, train, oot, target, summary,
             len(period_context["gaps"])))
 
     export_names = {
-        feature: str(feature).replace("_woe", "") for feature in selected}
+        feature: str(feature).replace("_woe", "") for feature in plot_targets}
     name_counts = Counter(export_names.values())
     collision_groups = {name for name, count in name_counts.items()
                         if count > 1}
@@ -1753,7 +1771,7 @@ def generate_feature_analysis_plots(data, train, oot, target, summary,
     info_map = summary.set_index("feature").to_dict("index")
     index_rows, time_rows = [], []
     failures = []
-    for position, feature in enumerate(selected, 1):
+    for position, feature in enumerate(plot_targets, 1):
         export_name = export_names[feature]
         file_stem = _safe_filename(
             feature if export_name in collision_groups else export_name)
@@ -1769,6 +1787,10 @@ def generate_feature_analysis_plots(data, train, oot, target, summary,
             analysis = _prepare_feature_analysis(
                 feature, export_name, detail.copy(), info, data, target,
                 train, oot, period_context, params)
+            if manual_features and not bool(info.get("selected", False)):
+                analysis["reason"]["candidate_reason"] = (
+                    "Requested by user; screening status: {}.".format(
+                        _screen_reason_en(info.get("reason", ""))))
             reason = dict(analysis["reason"])
             _render_feature_figure(
                 analysis, info, params, plt, png_path, pdf_path)
@@ -1797,8 +1819,8 @@ def generate_feature_analysis_plots(data, train, oot, target, summary,
             "collision_group": (export_name
                                 if export_name in collision_groups else ""),
         })
-        if position % 10 == 0 or position == len(selected):
-            print("分析绘图：{}/{}".format(position, len(selected)))
+        if position % 10 == 0 or position == len(plot_targets):
+            print("分析绘图：{}/{}".format(position, len(plot_targets)))
     index_frame = pd.DataFrame(index_rows, columns=_INDEX_COLUMNS)
     time_frame = (pd.concat(time_rows, ignore_index=True)
                   if time_rows else empty_time)
@@ -1836,7 +1858,8 @@ def run_feature_screening(root_dir, min_iv=0.02, n_bins=5,
                           oot_start=None, oot_ratio=0.3,
                           max_psi=0.25, max_missing_iv_share=0.5,
                           dedup_corr=0.8,
-                          plot_results=True, plot_pdf=False, plot_dpi=200,
+                          plot_results=True, plot_features=None,
+                          plot_pdf=False, plot_dpi=200,
                           time_freq="week",
                           plot_min_bin_n=30, plot_min_bin_good=5,
                           plot_min_bin_bad=5, plot_min_period_n=100,
@@ -1863,8 +1886,10 @@ def run_feature_screening(root_dir, min_iv=0.02, n_bins=5,
     {根目录}/feature_screening_reports/{样本文件名}_{变量表文件名}_{标签名}/，
     文件名不含日期；同一组合重复运行覆盖同名文件，分析图按特征名命名。
 
-    分析绘图（去重完成后仅对最终候选特征执行，不改变筛选结果）：
+    分析绘图（默认对去重后的最终候选特征执行，不改变筛选结果）：
     plot_results: 是否生成分析图、候选原因和明细；默认开启。
+    plot_features: 指定要出图的变量清单；非空时只画这些变量（不论是否入选），
+        None 或空列表表示画最终候选。未进入筛选结果的变量会跳过并提示。
     plot_pdf: 是否同时导出 PDF；默认只导出 PNG。
     plot_dpi: PNG 分辨率，默认 200，支持 200~300。
     time_freq: 分期粒度 day/week/month，默认 week；一次运行内所有特征一致。
@@ -2063,6 +2088,22 @@ def run_feature_screening(root_dir, min_iv=0.02, n_bins=5,
     candidates = summary.loc[summary["selected"], ["feature"]].reset_index(drop=True)
     candidates["feature"] = candidates["feature"].str.replace("_woe", "", regex=False)
     candidates = candidates.drop_duplicates().reset_index(drop=True)
+    if plot_results and plot_features is not None:
+        if isinstance(plot_features, str):
+            plot_features = [plot_features]
+        requested = []
+        for name in plot_features:
+            name = str(name).strip()
+            if name and name not in requested:
+                requested.append(name)
+        known = set(summary["feature"])
+        unknown = [name for name in requested if name not in known]
+        if unknown:
+            print("警告：以下变量不在筛选结果中，已跳过：{}".format(
+                "、".join(unknown)))
+        plot_features = [name for name in requested if name in known] or None
+        if requested and plot_features is None:
+            raise ValueError("plot_features 中没有可绘制的变量。")
     run_name = "{}_{}_{}".format(
         _safe_filename(Path(sample_file).stem, max_len=40),
         _safe_filename(Path(variable_file).stem, max_len=40),
@@ -2081,6 +2122,7 @@ def run_feature_screening(root_dir, min_iv=0.02, n_bins=5,
             "max_psi": float(max_psi),
             "max_missing_iv_share": max_missing_iv_share,
             "dedup_corr": dedup_corr,
+            "plot_features": plot_features,
             "plot_pdf": bool(plot_pdf),
             "plot_dpi": int(plot_dpi),
             "time_freq": time_freq,
