@@ -1536,15 +1536,13 @@ def _plot_bin_profile(axes, ordered, meta, x_labels, min_bin_n):
     iv_ax.set_title("IV contribution by bin", fontsize=_FS_PANEL_TITLE,
                     loc="left", color=_INK, pad=6)
 
-    for axis in chart_axes[:-1]:
-        axis.set_xticks([])
-    iv_ax.set_xticks(positions)
     rotation = 0 if max(len(str(label)) for label in x_labels) <= 14 else 18
-    iv_ax.set_xticklabels(x_labels, fontsize=_FS_TICK, color=_INK_SOFT,
-                          rotation=rotation,
-                          ha="center" if rotation == 0 else "right")
-    iv_ax.tick_params(axis="x", pad=6)
     for axis in chart_axes:
+        axis.set_xticks(positions)
+        axis.set_xticklabels(x_labels, fontsize=_FS_TICK, color=_INK_SOFT,
+                            rotation=rotation,
+                            ha="center" if rotation == 0 else "right")
+        axis.tick_params(axis="x", pad=6)
         axis.set_xlim(-0.55, count - 0.45)
 
 
@@ -2049,18 +2047,21 @@ def _plot_time_trend(axes, periods, matrices, info, period_context,
     if limits:
         ax_iv.set_ylim(0, limits["iv"])
 
-    positions = _period_tick_positions(n_periods, 14)
-    ax_iv.set_xticks(x[positions])
-    rotation = 0 if n_periods <= 20 else 22
-    ax_iv.set_xticklabels([tick_labels[index] for index in positions],
-                          rotation=rotation,
-                          ha="center" if rotation == 0 else "right",
-                          fontsize=_FS_TICK)
-    ax_iv.tick_params(axis="x", pad=6)
-    for axis in axes[:-1]:
-        axis.set_xticks([])
     for axis in axes:
+        max_labels = 9 if axis is not ax_bad else 14
+        positions = _period_tick_positions(n_periods, max_labels)
+        axis.set_xticks(x[positions])
+        axis.set_xticklabels([tick_labels[index] for index in positions],
+                            rotation=0 if n_periods <= 12 else 22,
+                            fontsize=_FS_TICK)
+        axis.tick_params(axis="x", pad=6)
         axis.set_xlim(-0.6, n_periods - 0.4)
+    ax_n.set_title("Sample volume by period", loc="left",
+                   fontsize=_FS_PANEL_TITLE, color=_INK, pad=8)
+    ax_iv.set_title("IV by period", loc="left",
+                    fontsize=_FS_PANEL_TITLE, color=_INK, pad=8)
+    ax_bad.set_title("Bad rate by period", loc="left",
+                     fontsize=_FS_PANEL_TITLE, color=_INK, pad=8)
 
 
 def _bin_legend_handles(labels, is_missing):
@@ -2524,14 +2525,13 @@ def _layout_single_report_figure(fig, header_bottom):
     # Explicit space for titles, tick labels and table captions. Zero grid
     # spacing is intentional: each inter-panel gap has its own height.
     rows = [
-        ("head_profile", 0.90), ("spacer", 0.30), ("profile", 6.20),
+        ("head_profile", 0.90), ("spacer", 0.30), ("profile", 4.40),
         ("spacer", 0.60), ("bin_table", 2.80), ("spacer", 0.35),
-        ("head_trend", 0.90), ("spacer", 0.20), ("trend", 4.60),
+        ("head_trend", 0.90), ("spacer", 0.20), ("trend", 4.10),
         ("spacer", 0.60), ("period_table", 2.80), ("spacer", 0.35),
         ("head_bins", 0.90), ("spacer", 0.30), ("heatmap", 2.90),
         ("spacer", 0.85), ("psi", 2.80), ("spacer", 0.65),
-        ("head_lines", 0.90), ("spacer", 0.30), ("woe_lines", 2.80),
-        ("spacer", 0.65), ("bad_rate_lines", 2.80), ("spacer", 0.65),
+        ("head_lines", 0.90), ("spacer", 0.30), ("risk_lines", 2.80), ("spacer", 0.65),
         ("head_drift", 0.65), ("drift_row", 2.10),
         ("spacer", 0.20), ("footer", 1.40),
     ]
@@ -2545,14 +2545,21 @@ def _layout_single_report_figure(fig, header_bottom):
             continue
         if name == "profile":
             sub = grid[index, 0].subgridspec(
-                4, 1, hspace=0.48, height_ratios=[1.05, 1.15, 1.0, 1.0])
+                2, 2, hspace=0.55, wspace=0.16)
             axes["profile"] = [
-                fig.add_subplot(sub[row, 0]) for row in range(4)]
+                fig.add_subplot(sub[row, col])
+                for row in range(2) for col in range(2)]
         elif name == "trend":
             sub = grid[index, 0].subgridspec(
-                3, 1, hspace=0.28, height_ratios=[1.0, 1.12, 0.95])
-            axes["trend"] = [
-                fig.add_subplot(sub[row, 0]) for row in range(3)]
+                2, 2, hspace=0.50, wspace=0.16,
+                height_ratios=[1.0, 1.0])
+            axes["trend"] = [fig.add_subplot(sub[0, 0]),
+                             fig.add_subplot(sub[1, :]),
+                             fig.add_subplot(sub[0, 1])]
+        elif name == "risk_lines":
+            sub = grid[index, 0].subgridspec(1, 2, wspace=0.18)
+            axes["woe_lines"] = fig.add_subplot(sub[0, 0])
+            axes["bad_rate_lines"] = fig.add_subplot(sub[0, 1])
         else:
             axes[name] = fig.add_subplot(grid[index, 0])
     return axes
@@ -2653,7 +2660,7 @@ def _render_single_report_figure(fig, analysis, info, params, png_path,
 
 
 def _report_figure_size():
-    return (18.0, 43.0)
+    return (18.0, 36.0)
 
 
 def _render_feature_plot(analysis, info, params, plt, plots_dir, file_stem):
