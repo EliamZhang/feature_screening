@@ -15,9 +15,9 @@ OOT 稳定且缺失贡献不超限筛选；入选后再按 WOE 相关性贪心�
 （dedup_corr），剔除与更高 IV 变量高度相关的变量。
 
 筛选完成后可对最终候选特征批量生成分析图（默认开启）：整体分箱占比/
-坏账率/WOE/IV 贡献、OOT 对照、分期趋势、WOE 热力图、分期占比与 PSI
-来源，并在图底部标注纳入候选的原因。也可通过 plot_features 指定变量
-清单，只绘制清单中的变量（不论是否入选）。绘图只读取现有结果，不修改
+坏账率/WOE/IV 贡献、OOT 对照、分期趋势、分期 WOE/样本占比/坏账率曲线
+与 PSI 来源，并在图底部标注纳入候选的原因。也可通过 plot_features 指定
+变量清单，只绘制清单中的变量（不论是否入选）。绘图只读取现有结果，不修改
 selected、reason、候选清单或分箱边界。绘图依赖 matplotlib。
 
 结果按样本表文件名、变量表文件名和标签归档到
@@ -67,7 +67,6 @@ _TRAIN_COLOR = "#2C7FB8"
 _OOT_COLOR = "#E6A23C"
 _MISSING_COLOR = "#8C8C8C"
 _THRESHOLD_COLOR = "#C0392B"
-_LOW_SAMPLE_HATCH = "////"
 _BIN_PALETTE = (
     "#4E79A7", "#F28E2B", "#59A14F", "#E15759",
     "#76B7B2", "#EDC948", "#B07AA1", "#FF9DA7",
@@ -83,10 +82,8 @@ _FS_AXIS_LABEL = 9.0
 _FS_TICK = 8.5
 _FS_LEGEND = 8.0
 _FS_CELL_MIN = 7.0
-_FS_CELL_MAX = 8.5
 _FS_FOOTER = 10.0
 _FS_TABLE = 7.8
-_STACK_HEATMAPS_AFTER = 16
 
 
 def _check_binning_parameters(n_bins, n_prebins, min_bin_pct):
@@ -1072,7 +1069,8 @@ def _time_bin_matrices(values, labels, detail, period_context,
     matrices = {
         "bin_n": bin_n, "bin_bad": bin_bad, "bin_good": bin_good,
         "mapped_n": mapped_n, "total_n": total_n, "uncovered_n": uncovered_n,
-        "coverage": coverage, "bad_rate": bad_rate, "sample_pct": sample_pct,
+        "coverage": coverage, "bad_rate": bad_rate,
+        "bin_bad_rate": bin_bad_rate, "sample_pct": sample_pct,
         "woe": woe, "iv_part": iv_part, "period_iv": period_iv,
         "period_psi": period_psi, "psi_contrib": psi_contrib,
         "period_valid": period_valid, "low_n": low_n_flag,
@@ -1317,20 +1315,6 @@ def _add_wrapped_fig_text(fig, x, y, text, fontsize, color="#111111",
                  weight=weight, ha=ha, va="top")
         y -= line_step
     return y
-
-
-def _heatmap_cell_inches(ax, rows, columns):
-    position = ax.get_position()
-    fig_width, fig_height = ax.figure.get_size_inches()
-    # 预留色标、刻度和说明文字占用的空间。
-    width_in = position.width * fig_width * 0.86
-    height_in = position.height * fig_height * 0.66
-    return width_in / max(columns, 1), height_in / max(rows, 1)
-
-
-def _heatmap_value_fontsize(cell_height_in):
-    return max(_FS_CELL_MIN,
-               min(_FS_CELL_MAX, cell_height_in * 72.0 * 0.40))
 
 
 def _plot_share_panel(ax, ax_table, ordered, meta, info, short_labels,
@@ -1754,129 +1738,93 @@ def _plot_time_trend(axes, periods, matrices, info, period_context,
         axis.set_xlim(-0.6, n_periods - 0.4)
 
 
-def _masked_cmap(plt, name, bad_color):
-    cmap = plt.get_cmap(name).copy()
-    if hasattr(cmap, "with_extremes"):
-        return cmap.with_extremes(bad=bad_color)
-    cmap.set_bad(bad_color)
-    return cmap
-
-
-def _plot_woe_heatmap(ax, ordered, matrices, periods, period_context,
-                      short_labels, min_bin_n, plt, vlim=None):
-    from matplotlib.patches import Rectangle
-    woe = matrices["woe"].T
-    masked = np.ma.masked_invalid(woe)
-    finite = np.abs(woe[np.isfinite(woe)])
-    limit = (float(vlim) if vlim is not None
-             else max(float(finite.max()) * 1.05, 1e-3) if len(finite) else 1.0)
-    cmap = _masked_cmap(plt, "RdBu", "#D9D9D9")
-    image = ax.imshow(masked, aspect="auto", cmap=cmap, vmin=-limit,
-                      vmax=limit, interpolation="nearest", zorder=1)
-    bins, n_periods = woe.shape
-    ax.set_yticks(np.arange(bins))
-    ax.set_yticklabels(short_labels, fontsize=_FS_TICK)
-    ax.tick_params(axis="y", labelsize=_FS_TICK)
-    positions = _period_tick_positions(n_periods, 12)
-    labels = []
-    for index in range(n_periods):
-        label = str(periods.loc[index, "period_label"])
-        if periods.loc[index, "split"] == "跨界":
-            label += "*"
+def _draw_bin_legend(ax, short_labels, is_missing):
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+    handles, labels = [], []
+    for index, label in enumerate(short_labels):
+        handles.append(Line2D(
+            [0], [0], color=_bin_color(index, bool(is_missing[index])),
+            lw=1.8, marker="o", markersize=4))
         labels.append(label)
-    ax.set_xticks(positions)
-    ax.set_xticklabels([labels[index] for index in positions],
-                       rotation=45, ha="right", fontsize=_FS_TICK)
-    ax.tick_params(axis="x", pad=5)
-    _draw_period_overlay(ax, periods, period_context["first_oot"])
+    handles.append(Line2D(
+        [0], [0], color="#444444", lw=0, marker="o", markersize=5,
+        markerfacecolor="white"))
+    labels.append("Low sample")
+    handles.append(Line2D([0], [0], color="#333333", lw=1.2, ls="--"))
+    labels.append("OOT split")
+    handles.append(Patch(facecolor="#9E9E9E", alpha=0.30, edgecolor="none"))
+    labels.append("Crossing period")
+    ax.axis("off")
+    ax.text(0.0, 0.5, "Period lines by bin", fontsize=_FS_PANEL_TITLE,
+            weight="bold", va="center")
+    ax.legend(handles, labels, loc="center left",
+              bbox_to_anchor=(0.13, 0.5), ncol=min(5, len(handles)),
+              frameon=False, fontsize=_FS_LEGEND, handlelength=1.8,
+              columnspacing=1.0, handletextpad=0.5)
+
+
+def _plot_period_lines(ax, matrices, periods, period_context, short_labels,
+                       is_missing, metric, ylabel, title,
+                       percent=False, zero_line=False, show_xlabels=True):
+    values = matrices[metric].T
+    bins, n_periods = values.shape
+    if metric != "woe":
+        values = np.where(matrices["bin_n"].T > 0, values, np.nan)
+    x = np.arange(n_periods)
+    marker_size = 3.2 if n_periods <= 30 else 2.2
+    scatter_size = 20 if n_periods <= 30 else 14
+    for row in range(bins):
+        ax.plot(x, values[row], color=_bin_color(row, bool(is_missing[row])),
+                lw=1.5, marker="o", markersize=marker_size, zorder=3)
     unreliable = (matrices["low_n"] | matrices["zero_good"]
                   | matrices["zero_bad"] | matrices["low_good"]
                   | matrices["low_bad"]).T
-    empty = matrices["empty"].T
-    valid_period = matrices["period_valid"]
     for row in range(bins):
-        for column in range(n_periods):
-            if unreliable[row, column] and not empty[row, column] \
-                    and valid_period[column]:
-                ax.add_patch(Rectangle(
-                    (column - 0.5, row - 0.5), 1, 1, fill=False,
-                    hatch=_LOW_SAMPLE_HATCH, edgecolor="#444444",
-                    linewidth=0.0, zorder=3))
-    cell_w, cell_h = _heatmap_cell_inches(ax, bins, n_periods)
-    show_values = (cell_w >= 0.30 and cell_h >= 0.16
-                   and bins * n_periods <= 400)
-    if show_values:
-        value_size = _heatmap_value_fontsize(cell_h)
-        for row in range(bins):
-            for column in range(n_periods):
-                value = woe[row, column]
-                if np.isfinite(value):
-                    ax.text(column, row, "{:.2f}".format(value),
-                            ha="center", va="center", fontsize=value_size,
-                            color="white" if abs(value) > 0.62 * limit
-                            else "#222222", zorder=4)
-    ax.set_title("Period WOE heatmap (fixed train bins)",
-                 fontsize=_FS_PANEL_TITLE, loc="left", pad=8)
-    note = _wrap_text_for_axes(
-        ax, "Positive = lower risk (blue); negative = higher risk (red); "
-            "grey = empty/single-class; hatched = low sample or zero good/bad.",
-        _FS_NOTE)
-    ax.text(0.0, -0.28, note, transform=ax.transAxes, ha="left", va="top",
-            fontsize=_FS_NOTE, color="#555555", clip_on=False)
-    colorbar = ax.figure.colorbar(image, ax=ax, fraction=0.025, pad=0.015)
-    colorbar.set_label("WOE", fontsize=_FS_AXIS_LABEL)
-    colorbar.ax.tick_params(labelsize=_FS_TICK)
-
-
-def _plot_share_heatmap(ax, matrices, periods, period_context, short_labels,
-                        plt, vmax=None):
-    share = matrices["sample_pct"].T
-    masked = np.ma.masked_where(matrices["bin_n"].T == 0, share)
-    finite = share[np.isfinite(share)]
-    upper = (float(vmax) if vmax is not None
-             else max(float(finite.max()) * 1.05, 1e-3) if len(finite) else 1.0)
-    cmap = _masked_cmap(plt, "Blues", "#D9D9D9")
-    image = ax.imshow(masked, aspect="auto", cmap=cmap, vmin=0,
-                      vmax=upper, interpolation="nearest", zorder=1)
-    bins, n_periods = share.shape
-    ax.set_yticks(np.arange(bins))
-    ax.set_yticklabels(short_labels, fontsize=_FS_TICK)
+        mask = unreliable[row] & np.isfinite(values[row])
+        if mask.any():
+            ax.scatter(x[mask], values[row][mask], facecolors="white",
+                       edgecolors=_bin_color(row, bool(is_missing[row])),
+                       s=scatter_size, linewidths=0.9, zorder=4)
+    if zero_line:
+        ax.axhline(0, color="#777777", lw=0.8, zorder=1)
+    ax.set_ylabel(ylabel, fontsize=_FS_AXIS_LABEL)
+    ax.set_title(title, fontsize=_FS_PANEL_TITLE, loc="left", pad=8)
+    ax.grid(axis="y", color="#E8E8E8", lw=0.6, zorder=0)
+    ax.set_axisbelow(True)
     ax.tick_params(axis="y", labelsize=_FS_TICK)
-    positions = _period_tick_positions(n_periods, 12)
-    labels = []
-    for index in range(n_periods):
-        label = str(periods.loc[index, "period_label"])
-        if periods.loc[index, "split"] == "跨界":
-            label += "*"
-        labels.append(label)
+    finite = values[np.isfinite(values)]
+    if len(finite):
+        if percent:
+            upper = min(max(float(finite.max()) * 1.12, 0.01), 1.0)
+            ax.set_ylim(0, upper)
+            from matplotlib.ticker import PercentFormatter
+            ax.yaxis.set_major_formatter(PercentFormatter(1.0, decimals=0))
+        else:
+            limit = max(float(np.abs(finite).max()) * 1.12, 1e-3)
+            ax.set_ylim(-limit, limit)
+    positions = _period_tick_positions(n_periods, 14)
     ax.set_xticks(positions)
-    ax.set_xticklabels([labels[index] for index in positions],
-                       rotation=45, ha="right", fontsize=_FS_TICK)
+    if show_xlabels:
+        labels = []
+        for index in range(n_periods):
+            label = str(periods.loc[index, "period_label"])
+            if periods.loc[index, "split"] == "跨界":
+                label += "*"
+            labels.append(label)
+        ax.set_xticklabels([labels[index] for index in positions],
+                           rotation=45, ha="right", fontsize=_FS_TICK)
+    else:
+        ax.set_xticklabels([])
     ax.tick_params(axis="x", pad=5)
+    ax.set_xlim(-0.6, n_periods - 0.4)
     _draw_period_overlay(ax, periods, period_context["first_oot"])
-    cell_w, cell_h = _heatmap_cell_inches(ax, bins, n_periods)
-    show_values = (cell_w >= 0.30 and cell_h >= 0.16
-                   and bins * n_periods <= 400)
-    if show_values:
-        value_size = _heatmap_value_fontsize(cell_h)
-        for row in range(bins):
-            for column in range(n_periods):
-                value = share[row, column]
-                if np.isfinite(value):
-                    ax.text(column, row, "{:.0%}".format(value),
-                            ha="center", va="center", fontsize=value_size,
-                            color="white" if value > 0.55 * upper
-                            else "#222222", zorder=4)
-    ax.set_title("Period sample share (denominator = mapped samples in period)",
-                 fontsize=_FS_PANEL_TITLE, loc="left", pad=8)
-    note = _wrap_text_for_axes(
-        ax, "Grey = empty bin; * = period crossing train/OOT split; "
-            "coverage gaps: see reason and detail CSV.", _FS_NOTE)
-    ax.text(0.0, -0.28, note, transform=ax.transAxes, ha="left", va="top",
-            fontsize=_FS_NOTE, color="#555555", clip_on=False)
-    colorbar = ax.figure.colorbar(image, ax=ax, fraction=0.025, pad=0.015)
-    colorbar.set_label("Sample share", fontsize=_FS_AXIS_LABEL)
-    colorbar.ax.tick_params(labelsize=_FS_TICK)
+
+
+
+
+
+
 
 
 def _plot_psi_panel(ax, ordered, matrices, periods, period_context,
@@ -1985,15 +1933,13 @@ def _plot_psi_panel(ax, ordered, matrices, periods, period_context,
 
 
 def _feature_plot_limits(analysis, max_psi):
-    """统一的纵轴和色标范围，保证各面板可直接比较。"""
+    """统一各分期面板的纵轴范围，保证趋势量级可直接比较。"""
     matrices = analysis["matrices"]
     meta = analysis["overall_meta"]
     reason = analysis["reason"]
 
-    def finite_max(values, default=0.0, absolute=False):
+    def finite_max(values, default=0.0):
         array = np.asarray(values, dtype=float)
-        if absolute:
-            array = np.abs(array)
         array = array[np.isfinite(array)]
         return float(array.max()) if array.size else float(default)
 
@@ -2021,10 +1967,7 @@ def _feature_plot_limits(analysis, max_psi):
         psi_max = finite_max(matrices["period_psi"], 0.0)
     psi = max(max(psi_max, float(max_psi)) * 1.35, 1e-6)
 
-    woe = max(finite_max(matrices["woe"], 0.0, absolute=True) * 1.05, 1e-3)
-    share = max(finite_max(matrices["sample_pct"], 0.0) * 1.05, 1e-3)
-    return {"samples": samples, "bad_rate": bad_rate, "iv": iv,
-            "psi": psi, "woe": woe, "share": share}
+    return {"samples": samples, "bad_rate": bad_rate, "iv": iv, "psi": psi}
 
 
 def _period_tick_labels(periods, matrices):
@@ -2107,21 +2050,18 @@ def _draw_figure_header(fig, analysis, info, params):
     return max(0.60, min(0.95, y - 0.008))
 
 
-def _layout_feature_figure(fig, stacked_heatmaps, header_bottom):
-    # 显式间隔行代替统一 hspace：旋转日期标签、热力图说明需要的留白不同。
-    rows = [("overall", 6.40), ("spacer", 0.35), ("trend_legend", 0.35),
-            ("trend", 2.60), ("spacer", 1.15)]
-    if stacked_heatmaps:
-        rows.append(("woe_heat", 2.20))
-        rows.append(("spacer", 1.05))
-        rows.append(("share_heat", 2.20))
-    else:
-        rows.append(("heat", 2.35))
-    rows.append(("spacer", 1.45))
-    rows.append(("psi_legend", 0.35))
-    rows.append(("psi", 2.10))
-    rows.append(("spacer", 0.60))
-    rows.append(("reason", 0.80))
+def _layout_feature_figure(fig, header_bottom):
+    # 显式间隔行代替统一 hspace：日期标签、图例和说明文字需要的留白不同。
+    rows = [
+        ("overall", 6.40), ("spacer", 0.35), ("trend_legend", 0.35),
+        ("trend", 2.60), ("spacer", 1.15),
+        ("bin_legend", 0.55), ("spacer", 0.20),
+        ("woe_lines", 2.20), ("spacer", 0.85),
+        ("share_lines", 2.20), ("spacer", 0.85),
+        ("bad_rate_lines", 2.20), ("spacer", 1.25),
+        ("psi_legend", 0.35), ("psi", 2.10), ("spacer", 0.60),
+        ("reason", 0.80),
+    ]
     heights = [row[1] for row in rows]
     grid = fig.add_gridspec(
         len(rows), 6, height_ratios=heights,
@@ -2147,13 +2087,14 @@ def _layout_feature_figure(fig, stacked_heatmaps, header_bottom):
             trend_grid = grid[index, :].subgridspec(3, 1, hspace=0.14)
             axes["trend"] = [fig.add_subplot(trend_grid[i])
                              for i in range(3)]
-        elif name == "heat":
-            axes["woe_heat"] = fig.add_subplot(grid[index, 0:3])
-            axes["share_heat"] = fig.add_subplot(grid[index, 3:6])
-        elif name == "woe_heat":
-            axes["woe_heat"] = fig.add_subplot(grid[index, :])
-        elif name == "share_heat":
-            axes["share_heat"] = fig.add_subplot(grid[index, :])
+        elif name == "bin_legend":
+            axes["bin_legend"] = fig.add_subplot(grid[index, :])
+        elif name == "woe_lines":
+            axes["woe_lines"] = fig.add_subplot(grid[index, :])
+        elif name == "share_lines":
+            axes["share_lines"] = fig.add_subplot(grid[index, :])
+        elif name == "bad_rate_lines":
+            axes["bad_rate_lines"] = fig.add_subplot(grid[index, :])
         elif name == "psi_legend":
             axes["psi_legend"] = fig.add_subplot(grid[index, :])
         elif name == "psi":
@@ -2163,7 +2104,7 @@ def _layout_feature_figure(fig, stacked_heatmaps, header_bottom):
     return axes
 
 
-def _render_feature_figure(fig, analysis, info, params, plt, limits,
+def _render_feature_figure(fig, analysis, info, params, limits,
                            png_path, pdf_path=None):
     overall = analysis["overall"]
     meta = analysis["overall_meta"]
@@ -2176,8 +2117,7 @@ def _render_feature_figure(fig, analysis, info, params, plt, limits,
     matrices = analysis["matrices"]
     tick_labels = _period_tick_labels(periods, matrices)
     header_bottom = _draw_figure_header(fig, analysis, info, params)
-    stacked = int(period_context["n_periods"]) > _STACK_HEATMAPS_AFTER
-    axes = _layout_feature_figure(fig, stacked, header_bottom)
+    axes = _layout_feature_figure(fig, header_bottom)
 
     handles, labels = _plot_share_panel(
         axes["share"], axes["table"], overall, meta, info,
@@ -2218,12 +2158,21 @@ def _render_feature_figure(fig, analysis, info, params, plt, limits,
         fontsize=_FS_LEGEND, handlelength=1.6,
         columnspacing=0.9, handletextpad=0.5)
 
-    _plot_woe_heatmap(axes["woe_heat"], overall, matrices, periods,
-                      period_context, short_labels,
-                      params["plot_min_bin_n"], plt, vlim=limits["woe"])
-    _plot_share_heatmap(axes["share_heat"], matrices, periods,
-                        period_context, short_labels, plt,
-                        vmax=limits["share"])
+    is_missing = overall["is_missing"].to_numpy(dtype=bool)
+    _draw_bin_legend(axes["bin_legend"], short_labels, is_missing)
+    _plot_period_lines(
+        axes["woe_lines"], matrices, periods, period_context, short_labels,
+        is_missing, "woe", "WOE",
+        "Period WOE by bin (positive = lower risk)",
+        zero_line=True, show_xlabels=False)
+    _plot_period_lines(
+        axes["share_lines"], matrices, periods, period_context, short_labels,
+        is_missing, "sample_pct", "Sample share",
+        "Period sample share by bin", percent=True, show_xlabels=False)
+    _plot_period_lines(
+        axes["bad_rate_lines"], matrices, periods, period_context,
+        short_labels, is_missing, "bin_bad_rate", "Bad rate",
+        "Period bad rate by bin", percent=True, show_xlabels=True)
     psi_handles, psi_labels = _plot_psi_panel(
         axes["psi"], overall, matrices, periods, period_context,
         short_labels, params["max_psi"], ylim=limits["psi"])
@@ -2251,20 +2200,18 @@ def _render_feature_figure(fig, analysis, info, params, plt, limits,
                     bbox_inches="tight", facecolor="white")
 
 
-def _feature_figure_size(stacked):
-    return (17, 26) if stacked else (17, 23)
+def _feature_figure_size():
+    return (17, 27)
 
 
 def _render_feature_plot(analysis, info, params, plt, plots_dir, file_stem):
     png_path = plots_dir / (file_stem + ".png")
     pdf_path = (plots_dir / (file_stem + ".pdf")
                 if params["plot_pdf"] else None)
-    stacked = (int(analysis["period_context"]["n_periods"])
-               > _STACK_HEATMAPS_AFTER)
-    fig = plt.figure(figsize=_feature_figure_size(stacked))
+    fig = plt.figure(figsize=_feature_figure_size())
     try:
         _render_feature_figure(
-            fig, analysis, info, params, plt,
+            fig, analysis, info, params,
             _feature_plot_limits(analysis, params["max_psi"]),
             png_path, pdf_path)
         status, error = "成功", ""
