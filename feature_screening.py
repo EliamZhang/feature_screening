@@ -2374,7 +2374,7 @@ def _bin_display_labels(overall):
     return bin_ids, ranges, x_labels
 
 
-def _draw_report_header(fig, analysis, params):
+def _draw_report_header(fig, analysis, info, params):
     meta = analysis["overall_meta"]
     date_meta = analysis["date_meta"]
     period_context = analysis["period_context"]
@@ -2434,7 +2434,24 @@ def _draw_report_header(fig, analysis, params):
     y -= 0.001
     y = _add_wrapped_fig_text(fig, 0.010, y, note, _FS_NOTE,
                               color=_INK_SOFT)
-    return max(0.70, y - 0.006)
+    y -= 0.004
+    selected = bool(info.get("selected", False))
+    y = _add_wrapped_fig_text(
+        fig, 0.010, y, reason["candidate_reason"], _FS_SUBTITLE,
+        color="#2E7D4F" if selected else _INK, weight="bold")
+    y -= 0.002
+    y = _add_wrapped_fig_text(
+        fig, 0.010, y, _stability_summary_text(analysis, info, params),
+        _FS_SUBTITLE, color=_INK)
+    watch_items = (_overview_watch_items(analysis, info, params)
+                   + _stability_watch_items(analysis, params))
+    if watch_items:
+        y -= 0.002
+        y = _add_wrapped_fig_text(
+            fig, 0.010, y, "Watch: " + "; ".join(watch_items) + ".",
+            _FS_NOTE, color=_THRESHOLD_COLOR)
+    # Size the header from its wrapped text so the first panel never overlaps.
+    return y - 0.008
 
 
 def _stability_summary_text(analysis, info, params, include_screen=False):
@@ -2537,31 +2554,6 @@ def _draw_axes_text_block(ax, x, y, text, fontsize, color, weight="normal",
     return y
 
 
-def _draw_report_footer(ax, analysis, info, params):
-    ax.axis("off")
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    ax.plot([0.0, 1.0], [1.0, 1.0], transform=ax.transAxes,
-            color=_AXIS_COLOR, lw=0.8, clip_on=False)
-    selected = bool(info.get("selected", False))
-    reason_color = "#2E7D4F" if selected else _INK
-    y = 0.97
-    y = _draw_axes_text_block(
-        ax, 0.0, y, analysis["reason"]["candidate_reason"], 10.8,
-        reason_color, weight="bold")
-    y -= 0.012
-    y = _draw_axes_text_block(
-        ax, 0.0, y, _stability_summary_text(analysis, info, params), 10.2,
-        _INK)
-    watch_items = (_overview_watch_items(analysis, info, params)
-                   + _stability_watch_items(analysis, params))
-    if watch_items:
-        y -= 0.010
-        _draw_axes_text_block(
-            ax, 0.0, y, "Watch: " + "; ".join(watch_items) + ".", 9.5,
-            _THRESHOLD_COLOR)
-
-
 def _layout_single_report_figure(fig, header_bottom):
     # Explicit space for titles, tick labels and table captions. Zero grid
     # spacing is intentional: each inter-panel gap has its own height.
@@ -2574,7 +2566,6 @@ def _layout_single_report_figure(fig, header_bottom):
         ("spacer", 0.85), ("psi", 2.80), ("spacer", 0.65),
         ("head_lines", 0.90), ("spacer", 0.30), ("risk_lines", 2.80), ("spacer", 0.65),
         ("head_drift", 0.65), ("drift_row", 2.10),
-        ("spacer", 0.20), ("footer", 1.40),
     ]
     grid = fig.add_gridspec(
         len(rows), 1, height_ratios=[height for _, height in rows],
@@ -2617,7 +2608,7 @@ def _render_single_report_figure(fig, analysis, info, params, png_path,
     is_missing = overall["is_missing"].to_numpy(dtype=bool)
     tick_labels = _period_tick_labels(periods, matrices)
     limits = _feature_plot_limits(analysis, params["max_psi"])
-    header_bottom = _draw_report_header(fig, analysis, params)
+    header_bottom = _draw_report_header(fig, analysis, info, params)
     axes = _layout_single_report_figure(fig, header_bottom)
 
     _draw_section_header(
@@ -2699,7 +2690,6 @@ def _render_single_report_figure(fig, analysis, info, params, png_path,
         params["plot_min_bin_n"], params["plot_min_period_n"],
         show_title=False)
 
-    _draw_report_footer(axes["footer"], analysis, info, params)
     fig.savefig(str(png_path), dpi=params["plot_dpi"],
                 bbox_inches="tight", facecolor="white")
     if pdf_path is not None:
