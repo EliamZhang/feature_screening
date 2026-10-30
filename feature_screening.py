@@ -2074,32 +2074,88 @@ def _bin_legend_handles(labels, is_missing):
     return handles, list(labels)
 
 
-def _plot_period_lines(ax, matrices, periods, period_context, labels,
-                       is_missing, metric, ylabel, title,
-                       percent=False, zero_line=False, show_xlabels=True):
-    values = np.asarray(matrices[metric], dtype=float).T
-    bins, n_periods = values.shape
+def _period_line_colors(periods):
+    """分期折线颜色：训练期蓝色、OOT 橙色，均随时间由浅到深。"""
+    from matplotlib.colors import to_rgb
+    split = periods["split"].astype(str).to_numpy()
+    colors = [None] * len(periods)
+    for mask, base in ((split == "训练", _TRAIN_COLOR),
+                       (split != "训练", _OOT_COLOR)):
+        indices = np.flatnonzero(mask)
+        if not len(indices):
+            continue
+        base_rgb = np.asarray(to_rgb(base), dtype=float)
+        light_rgb = base_rgb + (1.0 - base_rgb) * 0.55
+        fractions = (np.linspace(0.0, 1.0, len(indices)) if len(indices) > 1
+                     else np.array([0.75]))
+        for index, fraction in zip(indices, fractions):
+            colors[index] = tuple(light_rgb + (base_rgb - light_rgb) * fraction)
+    return colors
+
+
+def _period_line_legend_handles(periods, has_unreliable):
+    """分期折线图例：期数不多时逐期列出，否则用渐变色示意。"""
+    from matplotlib.lines import Line2D
+    colors = _period_line_colors(periods)
+    split = periods["split"].astype(str).to_numpy()
+    handles = []
+    if len(periods) <= 14:
+        for index in range(len(periods)):
+            label = _compact_period_label(periods.loc[index, "period_label"])
+            if split[index] == "跨界":
+                label += "*"
+            handles.append(Line2D([], [], color=colors[index], lw=2.0,
+                                  marker="o", markersize=4.5, label=label))
+    else:
+        for mask, label in (
+                (split == "训练", "Train periods (light = early, dark = late)"),
+                (split != "训练", "OOT periods (light = early, dark = late)")):
+            indices = np.flatnonzero(mask)
+            if len(indices):
+                handles.append(Line2D([], [], color=colors[indices[-1]],
+                                      lw=2.0, label=label))
+    if has_unreliable:
+        handles.append(Line2D([], [], color=_THRESHOLD_COLOR, marker="o",
+                              ls="none", markerfacecolor="white",
+                              markeredgewidth=1.2, markersize=6,
+                              label="Unreliable estimate"))
+    return handles
+
+
+def _plot_period_lines(ax, matrices, periods, labels, is_missing, metric,
+                       ylabel, title, percent=False, zero_line=False):
+    """每个分期一条折线，横轴为分箱；颜色越深表示时间越近。"""
+    values = np.asarray(matrices[metric], dtype=float)
+    n_periods, bins = values.shape
     if metric != "woe":
-        values = np.where(matrices["bin_n"].T > 0, values, np.nan)
-    x = np.arange(n_periods)
-    marker_size = 4.2 if n_periods <= 30 else 3.0
-    scatter_size = 42 if n_periods <= 30 else 26
-    for row in range(bins):
-        ax.plot(x, values[row],
-                color=_bin_color(row, bool(is_missing[row])),
-                lw=2.0, marker="o", markersize=marker_size, zorder=3)
+        values = np.where(matrices["bin_n"] > 0, values, np.nan)
+    x = np.arange(bins)
+    colors = _period_line_colors(periods)
+    show_markers = n_periods <= 12
+    for row in range(n_periods):
+        ax.plot(x, values[row], color=colors[row],
+                lw=1.9 if show_markers else 1.4,
+                marker="o" if show_markers else None,
+                markersize=3.8, alpha=0.92, zorder=3 + row * 0.001)
     unreliable = (matrices["low_n"] | matrices["zero_good"]
                   | matrices["zero_bad"] | matrices["low_good"]
-                  | matrices["low_bad"]).T
-    for row in range(bins):
+                  | matrices["low_bad"])
+    for row in range(n_periods):
         mask = unreliable[row] & np.isfinite(values[row])
         if mask.any():
             ax.scatter(x[mask], values[row][mask], facecolors="white",
-                       edgecolors=_bin_color(row, bool(is_missing[row])),
-                       s=scatter_size, linewidths=1.2, zorder=4)
+                       edgecolors=[colors[row]] * int(mask.sum()),
+                       s=30 if show_markers else 18, linewidths=1.1,
+                       zorder=4 + row * 0.001)
     if zero_line:
         ax.axhline(0, color=_INK_SOFT, lw=0.9, zorder=1)
     _style_chart_axis(ax)
+    is_missing = np.asarray(is_missing, dtype=bool)
+    for position in np.flatnonzero(is_missing):
+        ax.axvspan(position - 0.5, position + 0.5, color="#F1F3F5",
+                   zorder=0, lw=0)
+        ax.axvline(position - 0.5, color=_AXIS_COLOR, lw=1.0,
+                   ls=(0, (4, 3)), zorder=1)
     ax.set_ylabel(ylabel, fontsize=_FS_AXIS_LABEL, color=_INK_SOFT)
     ax.set_title(title, fontsize=_FS_PANEL_TITLE, loc="left", color=_INK,
                  pad=8)
@@ -2113,25 +2169,10 @@ def _plot_period_lines(ax, matrices, periods, period_context, labels,
         else:
             limit = max(float(np.abs(finite).max()) * 1.15, 1e-3)
             ax.set_ylim(-limit, limit)
-    positions = _period_tick_positions(n_periods, 14)
-    ax.set_xticks(positions)
-    if show_xlabels:
-        tick_labels = []
-        for index in range(n_periods):
-            label = _compact_period_label(periods.loc[index, "period_label"])
-            if periods.loc[index, "split"] == "跨界":
-                label += "*"
-            tick_labels.append(label)
-        rotation = 0 if n_periods <= 20 else 22
-        ax.set_xticklabels([tick_labels[index] for index in positions],
-                           rotation=rotation,
-                           ha="center" if rotation == 0 else "right",
-                           fontsize=_FS_TICK)
-    else:
-        ax.set_xticklabels([])
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=_FS_TICK)
     ax.tick_params(axis="x", pad=5)
-    ax.set_xlim(-0.6, n_periods - 0.4)
-    _draw_period_overlay(ax, periods, period_context["first_oot"])
+    ax.set_xlim(-0.5, bins - 0.5)
 
 
 def _plot_psi_panel(ax, ordered, matrices, periods, period_context,
@@ -2622,20 +2663,27 @@ def _render_single_report_figure(fig, analysis, info, params, png_path,
         axes["psi"], overall, matrices, periods, period_context, bin_ids,
         params["max_psi"], ylim=limits["psi"])
 
+    has_unreliable = bool(
+        (matrices["low_n"] | matrices["zero_good"] | matrices["zero_bad"]
+         | matrices["low_good"] | matrices["low_bad"]).any())
+    line_subtitle = ("Each line is one {}; color darkens over time; x-axis is "
+                     "the bin; hollow markers mark unreliable estimates."
+                     .format(params["time_freq"]))
+    if bool((periods["split"].astype(str) == "跨界").any()):
+        line_subtitle += " * marks periods spanning the Train/OOT split."
     _draw_section_header(
-        axes["head_lines"], "Bin risk trends | WOE and bad rate by period",
-        subtitle="Hollow markers mark unreliable estimates; bin colors follow the legend above.",
-        handles=bin_handles, labels=bin_labels,
-        ncol=min(len(bin_handles), 10))
+        axes["head_lines"], "Bin risk trends | WOE and bad rate by bin",
+        subtitle=line_subtitle,
+        handles=_period_line_legend_handles(periods, has_unreliable),
+        ncol=min(len(periods), 14) if len(periods) <= 14 else 2)
     _plot_period_lines(
-        axes["woe_lines"], matrices, periods, period_context, bin_ids,
-        is_missing, "woe", "WOE",
-        "Period WOE by bin (positive = lower risk)",
-        zero_line=True, show_xlabels=True)
+        axes["woe_lines"], matrices, periods, bin_ids,
+        is_missing, "woe", "WOE", "WOE by bin (line = period)",
+        zero_line=True)
     _plot_period_lines(
-        axes["bad_rate_lines"], matrices, periods, period_context, bin_ids,
-        is_missing, "bin_bad_rate", "Bad rate", "Period bad rate by bin",
-        percent=True, show_xlabels=True)
+        axes["bad_rate_lines"], matrices, periods, bin_ids,
+        is_missing, "bin_bad_rate", "Bad rate", "Bad rate by bin (line = period)",
+        percent=True)
 
     drift_subtitle = ("{}; d Share and d Bad are pp changes; "
                       "* = latest bin sample unreliable").format(
